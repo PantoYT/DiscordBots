@@ -1,0 +1,9 @@
+[submodule "Fred"]
+	path = Fred
+	url = https://github.com/PantoYT/Fred
+[submodule "Qred"]
+	path = Qred
+	url = https://github.com/PantoYT/Qred
+[submodule "Tred"]
+	path = Tred
+	url = https://github.com/PantoYT/Tred
