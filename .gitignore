@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+*.log
+
+# Sekrety / lokalna konfiguracja (siatka bezpieczenstwa na poziomie repo)
+.env
+credentials.json
+
+# Backupy botow - uruchamiane z folderow/submodulow, nie z zipow
+*.zip
