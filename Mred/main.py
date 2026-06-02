@@ -3,102 +3,38 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import os
 import httpx
-import base64
-from datetime import datetime, timezone
 
 load_dotenv()
 
-TOKEN          = os.getenv("DISCORD_TOKEN")
-OWNER_ID       = int(os.getenv("OWNER_ID"))
-SPOTIFY_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
-SPOTIFY_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+TOKEN       = os.getenv("DISCORD_TOKEN")
+OWNER_ID    = int(os.getenv("OWNER_ID"))
+LASTFM_KEY  = os.getenv("LASTFM_API_KEY", "")
 
-MRED_COLOR = 0x1DB954  # Spotify green
+MRED_COLOR  = 0xD51007  # Last.fm red
+
+LASTFM_URL  = "https://ws.audioscrobbler.com/2.0/"
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 
 # ---------------------------------------------------------------------------
-# Spotify token (Client Credentials — bez user auth)
+# Last.fm helper
 # ---------------------------------------------------------------------------
 
-_spotify_token:   str | None = None
-_token_expires_at: float     = 0.0
-
-async def get_spotify_token() -> str | None:
-    global _spotify_token, _token_expires_at
-    if not SPOTIFY_ID or not SPOTIFY_SECRET:
-        return None
-    now = datetime.now(timezone.utc).timestamp()
-    if _spotify_token and now < _token_expires_at - 30:
-        return _spotify_token
-    creds = base64.b64encode(f"{SPOTIFY_ID}:{SPOTIFY_SECRET}".encode()).decode()
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            "https://accounts.spotify.com/api/token",
-            headers={"Authorization": f"Basic {creds}"},
-            data={"grant_type": "client_credentials"},
-        )
-        r.raise_for_status()
-        data = r.json()
-        _spotify_token    = data["access_token"]
-        _token_expires_at = now + data["expires_in"]
-    return _spotify_token
-
-
-async def spotify_get(path: str, params: dict = None) -> dict | None:
-    token = await get_spotify_token()
-    if not token:
-        return None
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"https://api.spotify.com/v1/{path}",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params or {},
-            timeout=10,
-        )
+async def lfm(method: str, params: dict) -> dict:
+    p = {"method": method, "api_key": LASTFM_KEY, "format": "json", **params}
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(LASTFM_URL, params=p)
         r.raise_for_status()
         return r.json()
 
-# ---------------------------------------------------------------------------
-# Embed helpers
-# ---------------------------------------------------------------------------
-
-def track_embed(track: dict, title_prefix: str = "") -> discord.Embed:
-    name    = track["name"]
-    artists = ", ".join(a["name"] for a in track["artists"])
-    album   = track["album"]["name"]
-    url     = track["external_urls"].get("spotify", "")
-    image   = track["album"]["images"][0]["url"] if track["album"]["images"] else None
-    dur_ms  = track["duration_ms"]
-    dur     = f"{dur_ms//60000}:{(dur_ms%60000)//1000:02d}"
-
-    embed = discord.Embed(title=f"{title_prefix}{name}", url=url, color=MRED_COLOR)
-    embed.add_field(name="Artysta", value=artists, inline=True)
-    embed.add_field(name="Album",   value=album,   inline=True)
-    embed.add_field(name="Czas",    value=dur,     inline=True)
-    if image:
-        embed.set_thumbnail(url=image)
-    embed.set_footer(text="Mred • Spotify")
-    return embed
-
-
-def artist_embed(artist: dict) -> discord.Embed:
-    name       = artist["name"]
-    url        = artist["external_urls"].get("spotify", "")
-    followers  = artist.get("followers", {}).get("total", 0)
-    genres     = ", ".join(artist.get("genres", [])[:4]) or "—"
-    popularity = artist.get("popularity", 0)
-    image      = artist["images"][0]["url"] if artist.get("images") else None
-
-    embed = discord.Embed(title=name, url=url, color=MRED_COLOR)
-    embed.add_field(name="Followersów", value=f"{followers:,}", inline=True)
-    embed.add_field(name="Popularność", value=f"{popularity}/100",  inline=True)
-    embed.add_field(name="Gatunki",     value=genres,               inline=False)
-    if image:
-        embed.set_thumbnail(url=image)
-    embed.set_footer(text="Mred • Spotify")
-    return embed
+def lfm_img(images: list) -> str | None:
+    """Zwraca największy dostępny obrazek z Last.fm."""
+    for size in ("extralarge", "large", "medium"):
+        for img in images:
+            if img.get("size") == size and img.get("#text"):
+                return img["#text"]
+    return None
 
 # ---------------------------------------------------------------------------
 # Slash commands
@@ -106,184 +42,199 @@ def artist_embed(artist: dict) -> discord.Embed:
 
 @bot.tree.command(name="commands", description="Lista komend Mred")
 async def slash_commands(interaction: discord.Interaction):
-    embed = discord.Embed(title="Mred — Music Bot", description="Eksploracja muzyki przez Spotify API.", color=MRED_COLOR)
-    embed.add_field(name="/search <zapytanie>",      value="Szukaj utworu na Spotify",              inline=False)
-    embed.add_field(name="/artist <nazwa>",          value="Info o artyście + top tracki",          inline=False)
-    embed.add_field(name="/album <nazwa> [artysta]", value="Info o albumie",                        inline=False)
-    embed.add_field(name="/recommend <gatunek>",     value="Polecane tracki z gatunku",             inline=False)
-    embed.add_field(name="/genres",                  value="Lista dostępnych gatunków Spotify",     inline=False)
-    embed.add_field(name="/new",                     value="Nowe wydania w Polsce",                 inline=False)
-    embed.set_footer(text="Mred • Music Recurrent Editor & Dump • Spotify API")
+    embed = discord.Embed(title="Mred — Music Bot", description="Eksploracja muzyki przez Last.fm API.", color=MRED_COLOR)
+    embed.add_field(name="/search <utwór>",       value="Szukaj utworu na Last.fm",              inline=False)
+    embed.add_field(name="/artist <nazwa>",        value="Info o artyście + podobni",             inline=False)
+    embed.add_field(name="/toptracks <artysta>",   value="Top tracki artysty",                    inline=False)
+    embed.add_field(name="/album <artysta> <alb>", value="Info o albumie + tracklista",           inline=False)
+    embed.add_field(name="/similar <artysta>",     value="Podobni artyści",                       inline=False)
+    embed.add_field(name="/topcharts",             value="Globalne top tracki tego tygodnia",     inline=False)
+    embed.add_field(name="/tag <gatunek>",         value="Top tracki z gatunku",                  inline=False)
+    embed.set_footer(text="Mred • Music Recurrent Editor & Dump • Last.fm")
     await interaction.response.send_message(embed=embed)
+    if not LASTFM_KEY:
+        await interaction.followup.send("⚠️ Brak `LASTFM_API_KEY` w `.env`.", ephemeral=True)
 
-    if not SPOTIFY_ID:
-        await interaction.followup.send("⚠️ Brak `SPOTIFY_CLIENT_ID` w `.env` — komendy muzyczne nie działają.", ephemeral=True)
 
-
-@bot.tree.command(name="search", description="Szukaj utworu na Spotify")
-async def slash_search(interaction: discord.Interaction, zapytanie: str):
+@bot.tree.command(name="search", description="Szukaj utworu na Last.fm")
+async def slash_search(interaction: discord.Interaction, utwor: str):
     await interaction.response.defer()
     try:
-        data = await spotify_get("search", {"q": zapytanie, "type": "track", "limit": 5, "market": "PL"})
-        tracks = data["tracks"]["items"]
+        data   = await lfm("track.search", {"track": utwor, "limit": 6})
+        tracks = data["results"]["trackmatches"]["track"]
         if not tracks:
             await interaction.followup.send("❌ Brak wyników."); return
 
-        embed = discord.Embed(title=f"🔍 Wyniki: {zapytanie}", color=MRED_COLOR)
-        for i, t in enumerate(tracks, 1):
-            artists = ", ".join(a["name"] for a in t["artists"])
-            url     = t["external_urls"].get("spotify", "")
-            dur_ms  = t["duration_ms"]
-            dur     = f"{dur_ms//60000}:{(dur_ms%60000)//1000:02d}"
+        embed = discord.Embed(title=f"🔍 Wyniki: {utwor}", color=MRED_COLOR)
+        for t in tracks[:6]:
+            listeners = t.get("listeners", "?")
+            url       = t.get("url", "")
             embed.add_field(
-                name=f"{i}. {t['name']}",
-                value=f"{artists} · {t['album']['name']} · {dur}\n[Otwórz Spotify]({url})",
-                inline=False,
-            )
-        image = tracks[0]["album"]["images"][0]["url"] if tracks[0]["album"]["images"] else None
-        if image:
-            embed.set_thumbnail(url=image)
-        embed.set_footer(text="Mred • Spotify")
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Błąd Spotify: `{e}`")
-
-
-@bot.tree.command(name="artist", description="Info o artyście i jego top tracki")
-async def slash_artist(interaction: discord.Interaction, nazwa: str):
-    await interaction.response.defer()
-    try:
-        # Search for artist
-        data    = await spotify_get("search", {"q": nazwa, "type": "artist", "limit": 1, "market": "PL"})
-        artists = data["artists"]["items"]
-        if not artists:
-            await interaction.followup.send("❌ Nie znaleziono artysty."); return
-
-        artist   = artists[0]
-        artist_id = artist["id"]
-        top_data  = await spotify_get(f"artists/{artist_id}/top-tracks", {"market": "PL"})
-        top       = top_data["tracks"][:5]
-
-        embed = artist_embed(artist)
-        if top:
-            tracks_str = "\n".join(
-                f"`{i}.` [{t['name']}]({t['external_urls'].get('spotify','')})"
-                for i, t in enumerate(top, 1)
-            )
-            embed.add_field(name="🎵 Top tracki", value=tracks_str, inline=False)
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Błąd Spotify: `{e}`")
-
-
-@bot.tree.command(name="album", description="Info o albumie")
-async def slash_album(interaction: discord.Interaction, nazwa: str, artysta: str = None):
-    await interaction.response.defer()
-    try:
-        query = f"{nazwa} {artysta}" if artysta else nazwa
-        data  = await spotify_get("search", {"q": query, "type": "album", "limit": 1, "market": "PL"})
-        albums = data["albums"]["items"]
-        if not albums:
-            await interaction.followup.send("❌ Nie znaleziono albumu."); return
-
-        album    = albums[0]
-        album_id = album["id"]
-        details  = await spotify_get(f"albums/{album_id}", {"market": "PL"})
-
-        name     = details["name"]
-        artists  = ", ".join(a["name"] for a in details["artists"])
-        released = details["release_date"]
-        tracks   = details["total_tracks"]
-        url      = details["external_urls"].get("spotify", "")
-        image    = details["images"][0]["url"] if details["images"] else None
-
-        embed = discord.Embed(title=name, url=url, color=MRED_COLOR)
-        embed.add_field(name="Artysta",   value=artists,  inline=True)
-        embed.add_field(name="Wydany",    value=released, inline=True)
-        embed.add_field(name="Tracki",    value=str(tracks), inline=True)
-
-        top_tracks = details["tracks"]["items"][:5]
-        if top_tracks:
-            tlist = "\n".join(
-                f"`{t['track_number']}.` {t['name']} — {t['duration_ms']//60000}:{(t['duration_ms']%60000)//1000:02d}"
-                for t in top_tracks
-            )
-            embed.add_field(name="Tracklista (pierwsze 5)", value=tlist, inline=False)
-
-        if image:
-            embed.set_thumbnail(url=image)
-        embed.set_footer(text="Mred • Spotify")
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Błąd Spotify: `{e}`")
-
-
-@bot.tree.command(name="recommend", description="Polecane tracki z wybranego gatunku")
-async def slash_recommend(interaction: discord.Interaction, gatunek: str):
-    await interaction.response.defer()
-    try:
-        data   = await spotify_get("recommendations", {
-            "seed_genres": gatunek.lower().replace(" ", "-"),
-            "limit":       8,
-            "market":      "PL",
-        })
-        tracks = data.get("tracks", [])
-        if not tracks:
-            await interaction.followup.send(f"❌ Brak rekomendacji dla gatunku `{gatunek}`. Sprawdź `/genres`."); return
-
-        embed = discord.Embed(title=f"🎲 Rekomendacje — {gatunek}", color=MRED_COLOR)
-        for t in tracks:
-            artists = ", ".join(a["name"] for a in t["artists"])
-            url     = t["external_urls"].get("spotify", "")
-            embed.add_field(
-                name=t["name"],
-                value=f"{artists}\n[Spotify]({url})",
+                name=f"{t['name']}",
+                value=f"**{t['artist']}**\n👥 {int(listeners):,} słuchaczy\n[Last.fm]({url})",
                 inline=True,
             )
-        image = tracks[0]["album"]["images"][0]["url"] if tracks[0]["album"]["images"] else None
-        if image:
-            embed.set_thumbnail(url=image)
-        embed.set_footer(text="Mred • Spotify Recommendations")
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Błąd: `{e}`\nSprawdź `/genres` po listę dostępnych gatunków.")
-
-
-@bot.tree.command(name="genres", description="Lista dostępnych gatunków Spotify dla /recommend")
-async def slash_genres(interaction: discord.Interaction):
-    await interaction.response.defer()
-    try:
-        data   = await spotify_get("recommendations/available-genre-seeds")
-        genres = data.get("genres", [])
-        chunks = [genres[i:i+30] for i in range(0, min(len(genres), 90), 30)]
-        embed  = discord.Embed(title="🎵 Gatunki Spotify", color=MRED_COLOR)
-        for i, chunk in enumerate(chunks):
-            embed.add_field(name=f"Strona {i+1}", value=", ".join(f"`{g}`" for g in chunk), inline=False)
-        embed.set_footer(text="Użyj nazwy gatunku w /recommend • Mred")
+        embed.set_footer(text="Mred • Last.fm")
         await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(f"❌ Błąd: `{e}`")
 
 
-@bot.tree.command(name="new", description="Nowe wydania albumów w Polsce")
-async def slash_new(interaction: discord.Interaction):
+@bot.tree.command(name="artist", description="Info o artyście")
+async def slash_artist(interaction: discord.Interaction, nazwa: str):
     await interaction.response.defer()
     try:
-        data   = await spotify_get("browse/new-releases", {"country": "PL", "limit": 8})
-        albums = data["albums"]["items"]
-        embed  = discord.Embed(title="🆕 Nowe wydania — Polska", color=MRED_COLOR)
-        for a in albums:
-            artists = ", ".join(ar["name"] for ar in a["artists"])
-            url     = a["external_urls"].get("spotify", "")
-            embed.add_field(
-                name=a["name"],
-                value=f"{artists} · {a['release_date']}\n[Spotify]({url})",
-                inline=True,
-            )
-        image = albums[0]["images"][0]["url"] if albums and albums[0]["images"] else None
+        data   = await lfm("artist.getInfo", {"artist": nazwa, "autocorrect": 1})
+        artist = data["artist"]
+
+        name      = artist["name"]
+        url       = artist["url"]
+        listeners = int(artist["stats"]["listeners"])
+        playcount = int(artist["stats"]["playcount"])
+        bio       = artist.get("bio", {}).get("summary", "Brak opisu.")
+        bio       = bio.split("<a href")[0].strip()[:300] + "..." if len(bio) > 300 else bio
+        tags      = ", ".join(t["name"] for t in artist.get("tags", {}).get("tag", [])[:5]) or "—"
+        image     = lfm_img(artist.get("image", []))
+
+        embed = discord.Embed(title=name, url=url, description=bio, color=MRED_COLOR)
+        embed.add_field(name="Słuchaczy",   value=f"{listeners:,}", inline=True)
+        embed.add_field(name="Odtworzeń",   value=f"{playcount:,}", inline=True)
+        embed.add_field(name="Gatunki",     value=tags,             inline=False)
         if image:
             embed.set_thumbnail(url=image)
-        embed.set_footer(text="Mred • Spotify")
+        embed.set_footer(text="Mred • Last.fm")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Błąd: `{e}`")
+
+
+@bot.tree.command(name="toptracks", description="Top tracki artysty")
+async def slash_toptracks(interaction: discord.Interaction, artysta: str):
+    await interaction.response.defer()
+    try:
+        data   = await lfm("artist.getTopTracks", {"artist": artysta, "autocorrect": 1, "limit": 8})
+        tracks = data["toptracks"]["track"]
+        if not tracks:
+            await interaction.followup.send("❌ Brak wyników."); return
+
+        name  = tracks[0]["artist"]["name"]
+        embed = discord.Embed(title=f"🎵 Top tracki — {name}", color=MRED_COLOR)
+        for i, t in enumerate(tracks, 1):
+            plays = int(t.get("playcount", 0))
+            url   = t.get("url", "")
+            embed.add_field(
+                name=f"{i}. {t['name']}",
+                value=f"▶️ {plays:,} odtworzeń\n[Last.fm]({url})",
+                inline=True,
+            )
+        embed.set_footer(text="Mred • Last.fm")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Błąd: `{e}`")
+
+
+@bot.tree.command(name="album", description="Info o albumie i tracklista")
+async def slash_album(interaction: discord.Interaction, artysta: str, album: str):
+    await interaction.response.defer()
+    try:
+        data  = await lfm("album.getInfo", {"artist": artysta, "album": album, "autocorrect": 1})
+        alb   = data["album"]
+
+        name      = alb["name"]
+        artist    = alb["artist"]
+        url       = alb["url"]
+        playcount = int(alb.get("playcount", 0))
+        listeners = int(alb.get("listeners", 0))
+        tags      = ", ".join(t["name"] for t in alb.get("tags", {}).get("tag", [])[:4]) or "—"
+        image     = lfm_img(alb.get("image", []))
+        tracks    = alb.get("tracks", {}).get("track", [])[:10]
+
+        embed = discord.Embed(title=f"{name}", url=url, color=MRED_COLOR)
+        embed.add_field(name="Artysta",    value=artist,          inline=True)
+        embed.add_field(name="Słuchaczy",  value=f"{listeners:,}", inline=True)
+        embed.add_field(name="Odtworzeń",  value=f"{playcount:,}", inline=True)
+        embed.add_field(name="Gatunki",    value=tags,            inline=False)
+
+        if tracks:
+            tlist = "\n".join(
+                f"`{t['@attr']['rank']}.` {t['name']}" if isinstance(t, dict) and "@attr" in t
+                else f"`{i}.` {t['name']}"
+                for i, t in enumerate(tracks, 1)
+            )
+            embed.add_field(name="Tracklista", value=tlist[:1024], inline=False)
+
+        if image:
+            embed.set_thumbnail(url=image)
+        embed.set_footer(text="Mred • Last.fm")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Błąd: `{e}`")
+
+
+@bot.tree.command(name="similar", description="Artyści podobni do podanego")
+async def slash_similar(interaction: discord.Interaction, artysta: str):
+    await interaction.response.defer()
+    try:
+        data    = await lfm("artist.getSimilar", {"artist": artysta, "autocorrect": 1, "limit": 8})
+        similar = data["similarartists"]["artist"]
+        if not similar:
+            await interaction.followup.send("❌ Brak podobnych artystów."); return
+
+        embed = discord.Embed(title=f"🎸 Podobni do {artysta}", color=MRED_COLOR)
+        for a in similar:
+            match = round(float(a.get("match", 0)) * 100)
+            url   = a.get("url", "")
+            embed.add_field(
+                name=a["name"],
+                value=f"Zgodność: {match}%\n[Last.fm]({url})",
+                inline=True,
+            )
+        embed.set_footer(text="Mred • Last.fm")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Błąd: `{e}`")
+
+
+@bot.tree.command(name="topcharts", description="Globalne top tracki tego tygodnia")
+async def slash_topcharts(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        data   = await lfm("chart.getTopTracks", {"limit": 10})
+        tracks = data["tracks"]["track"]
+
+        embed = discord.Embed(title="🌍 Globalne top tracki", color=MRED_COLOR)
+        for i, t in enumerate(tracks, 1):
+            plays = int(t.get("playcount", 0))
+            url   = t.get("url", "")
+            embed.add_field(
+                name=f"{i}. {t['name']}",
+                value=f"**{t['artist']['name']}**\n▶️ {plays:,}\n[Last.fm]({url})",
+                inline=True,
+            )
+        embed.set_footer(text="Mred • Last.fm")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Błąd: `{e}`")
+
+
+@bot.tree.command(name="tag", description="Top tracki z gatunku/tagu (np. rock, jazz, pop)")
+async def slash_tag(interaction: discord.Interaction, gatunek: str):
+    await interaction.response.defer()
+    try:
+        data   = await lfm("tag.getTopTracks", {"tag": gatunek, "limit": 8})
+        tracks = data["tracks"]["track"]
+        if not tracks:
+            await interaction.followup.send(f"❌ Brak wyników dla tagu `{gatunek}`."); return
+
+        embed = discord.Embed(title=f"🏷️ Top tracki — {gatunek}", color=MRED_COLOR)
+        for t in tracks:
+            url = t.get("url", "")
+            embed.add_field(
+                name=t["name"],
+                value=f"**{t['artist']['name']}**\n[Last.fm]({url})",
+                inline=True,
+            )
+        embed.set_footer(text="Mred • Last.fm")
         await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(f"❌ Błąd: `{e}`")
@@ -312,7 +263,7 @@ async def slash_shutdown(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 
 _status_idx   = 0
-_status_slots = ["Muzyka Spotify | /search", "Rekomendacje | /recommend", "Music Recurrent Editor & Dump"]
+_status_slots = ["Muzyka Last.fm | /search", "Top tracki | /topcharts", "Music Recurrent Editor & Dump"]
 
 @tasks.loop(minutes=5)
 async def rotate_status():
@@ -335,7 +286,7 @@ async def before_rotate():
 async def on_ready():
     print(f"[Mred] Logged in as {bot.user}")
     print(f"[Mred] Guilds: {len(bot.guilds)}")
-    print(f"[Mred] Spotify: {'enabled' if SPOTIFY_ID else 'disabled (brak SPOTIFY_CLIENT_ID)'}")
+    print(f"[Mred] Last.fm: {'enabled' if LASTFM_KEY else 'disabled (brak LASTFM_API_KEY)'}")
     try:
         synced = await bot.tree.sync()
         print(f"[Mred] Synced {len(synced)} commands")
@@ -344,7 +295,7 @@ async def on_ready():
     except Exception as e:
         print(f"[Mred] Sync error: {e}")
     await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.listening, name="Muzyka Spotify | /search"
+        type=discord.ActivityType.listening, name="Muzyka Last.fm | /search"
     ))
     rotate_status.start()
 
