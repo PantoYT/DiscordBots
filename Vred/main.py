@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import pytz
+import requests as req
 
 from client import VulcanClient
 
@@ -16,8 +17,12 @@ SCHEDULE_CHANNEL = os.getenv("SCHEDULE_CHANNEL", "plan-lekcji")
 EXAMS_CHANNEL    = os.getenv("EXAMS_CHANNEL", "sprawdziany")
 CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", 60))
 
-CET             = pytz.timezone("Europe/Warsaw")
-SEEN_EXAMS_FILE = "seen_exams.json"
+CET               = pytz.timezone("Europe/Warsaw")
+SEEN_EXAMS_FILE   = "seen_exams.json"
+SCHEDULE_MSG_FILE = "schedule_message.json"
+DAILY_HOUR        = int(os.getenv("DAILY_HOUR", 7))
+UPTIME_KUMA_URL   = os.getenv("UPTIME_KUMA_URL", "")
+last_schedule_run: str | None = None
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -43,6 +48,79 @@ def save_seen(seen: set):
 
 def get_client() -> VulcanClient:
     return VulcanClient()
+
+
+def load_schedule_msg() -> dict:
+    try:
+        with open(SCHEDULE_MSG_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_schedule_msg(data: dict):
+    with open(SCHEDULE_MSG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+def build_schedule_table(lessons: list, date_str: str) -> discord.Embed:
+    date_fmt = fmt_date(date_str)
+    embed = discord.Embed(title=f"📅 Plan lekcji — {date_fmt}", color=VRED_COLOR)
+
+    if not lessons:
+        embed.description = "```\nBrak lekcji tego dnia.\n```"
+        embed.set_footer(text="Vred • eduVulcan bot")
+        return embed
+
+    sorted_lessons = sorted(lessons, key=lambda l: l.get("TimeSlot", {}).get("Position", 99))
+
+    # Build monospace table
+    rows = []
+    for l in sorted_lessons:
+        slot    = l.get("TimeSlot", {})
+        pos     = str(slot.get("Position", "?"))
+        time    = slot.get("Display", "?????-?????")
+        subject = l.get("Subject", {}).get("Name", "?")[:24]
+        room    = l.get("Room")
+        room_s  = room["Code"] if room else "  -  "
+        change  = l.get("Change")
+        flag    = " !" if change else "  "
+        rows.append((pos, time, subject, room_s, flag))
+
+    # Column widths
+    w_pos  = max(len(r[0]) for r in rows)
+    w_time = max(len(r[1]) for r in rows)
+    w_subj = max(len(r[2]) for r in rows)
+    w_room = max(len(r[3]) for r in rows)
+
+    header = f"{'Nr':<{w_pos}}  {'Godziny':<{w_time}}  {'Przedmiot':<{w_subj}}  {'Sala':<{w_room}}"
+    sep    = "─" * len(header)
+    lines  = [header, sep]
+    for pos, time, subj, room, flag in rows:
+        lines.append(f"{pos:<{w_pos}}  {time:<{w_time}}  {subj:<{w_subj}}  {room:<{w_room}}{flag}")
+
+    embed.description = f"```\n{chr(10).join(lines)}\n```"
+    if any(r[4].strip() for r in rows):
+        embed.set_footer(text="! = zastępstwo  •  Vred • eduVulcan bot")
+    else:
+        embed.set_footer(text="Vred • eduVulcan bot")
+    return embed
+
+
+async def post_or_edit_schedule(channel: discord.TextChannel, embed: discord.Embed):
+    """Edytuje istniejącą wiadomość lub wysyła nową — jedna wiadomość na kanał."""
+    data    = load_schedule_msg()
+    msg_id  = data.get(str(channel.id))
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(msg_id)
+            await msg.edit(embed=embed)
+            return
+        except (discord.NotFound, discord.HTTPException):
+            pass
+    msg = await channel.send(embed=embed)
+    data[str(channel.id)] = msg.id
+    save_schedule_msg(data)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +203,40 @@ def schedule_embed(lessons: list, date_str: str) -> discord.Embed:
 
 
 # ---------------------------------------------------------------------------
+# Daily schedule post
+# ---------------------------------------------------------------------------
+
+@tasks.loop(minutes=1)
+async def daily_schedule():
+    global last_schedule_run
+    now      = datetime.now(CET)
+    today    = now.strftime("%Y-%m-%d")
+    if now.hour < DAILY_HOUR:
+        return
+    if last_schedule_run == today:
+        return
+    last_schedule_run = today
+
+    channel = discord.utils.get(bot.get_all_channels(), name=SCHEDULE_CHANNEL)
+    if not channel:
+        return
+    try:
+        client   = get_client()
+        lessons  = client.get_lessons(now, now)
+        date_str = today
+        day      = [l for l in lessons if l.get("Date", {}).get("Date") == date_str]
+        embed    = build_schedule_table(day, date_str)
+        await post_or_edit_schedule(channel, embed)
+    except Exception as e:
+        print(f"[daily_schedule] {e}")
+
+
+@daily_schedule.before_loop
+async def before_daily():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
 # Background task — nowe sprawdziany
 # ---------------------------------------------------------------------------
 
@@ -182,7 +294,13 @@ async def slash_plan(interaction: discord.Interaction):
         client   = get_client()
         lessons  = client.get_lessons(target, target)
         day      = [l for l in lessons if l.get("Date", {}).get("Date") == date_str]
-        await interaction.followup.send(embed=schedule_embed(day, date_str))
+        embed    = build_schedule_table(day, date_str)
+        # Aktualizuj wiadomość na kanale plan-lekcji jeśli komenda tam wywołana
+        if interaction.channel and interaction.channel.name == SCHEDULE_CHANNEL:
+            await post_or_edit_schedule(interaction.channel, embed)
+            await interaction.followup.send("✅ Plan zaktualizowany.", ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
 
@@ -410,6 +528,25 @@ async def before_rotate():
 
 
 # ---------------------------------------------------------------------------
+# Uptime Kuma heartbeat
+# ---------------------------------------------------------------------------
+
+@tasks.loop(minutes=1)
+async def uptime_ping():
+    if not UPTIME_KUMA_URL:
+        return
+    try:
+        req.get(UPTIME_KUMA_URL, timeout=5)
+    except Exception as e:
+        print(f"[uptime_ping] {e}")
+
+
+@uptime_ping.before_loop
+async def before_uptime():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
 
@@ -456,8 +593,10 @@ async def on_ready():
         name="Plan lekcji | /commands",
     ))
 
+    daily_schedule.start()
     check_exams.start()
     rotate_status.start()
+    uptime_ping.start()
 
 
 # -------------------------------
