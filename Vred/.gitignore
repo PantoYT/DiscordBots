@@ -1,0 +1,6 @@
+.env
+credentials.json
+seen_exams.json
+vred.log
+__pycache__/
+*.pyc
