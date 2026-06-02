@@ -2,7 +2,7 @@
 
 Mred is a Discord bot for exploring music through the Spotify API — search tracks, browse artists, get recommendations, and discover new releases.
 
-> **Note:** Mred does not play audio. It uses the Spotify Web API to display music information and recommendations.
+> **Note:** Mred does not play audio. It uses the Last.fm API to display music information — no Spotify Premium required.
 
 ## Features
 - 🔍 **Search**: Find tracks on Spotify
@@ -16,21 +16,21 @@ Mred is a Discord bot for exploring music through the Spotify API — search tra
 | Command | Description |
 |---------|-------------|
 | `/search <query>` | Search for a track |
-| `/artist <name>` | Artist info + top 5 tracks |
-| `/album <name> [artist]` | Album info + tracklist |
-| `/recommend <genre>` | Recommended tracks by genre |
-| `/genres` | List all available genre seeds |
-| `/new` | New album releases in Poland |
+| `/artist <name>` | Artist info + bio |
+| `/toptracks <artist>` | Top tracks by artist |
+| `/album <artist> <album>` | Album info + tracklist |
+| `/similar <artist>` | Similar artists |
+| `/topcharts` | Global top tracks this week |
+| `/tag <genre>` | Top tracks by genre/tag |
 
 ## Running your own instance
-1. Create a Spotify app at [developer.spotify.com](https://developer.spotify.com) → Create App
-2. Copy your **Client ID** and **Client Secret**
+1. Create a free API account at [last.fm/api/account/create](https://www.last.fm/api/account/create)
+2. Copy your **API key**
 3. Create a `.env` file:
    ```
    DISCORD_TOKEN=your_bot_token
    OWNER_ID=your_discord_id
-   SPOTIFY_CLIENT_ID=your_spotify_client_id
-   SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
+   LASTFM_API_KEY=your_lastfm_api_key
    ```
 4. Install dependencies:
    ```

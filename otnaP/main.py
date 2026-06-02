@@ -73,9 +73,9 @@ BOTS = {
     },
     "Mred": {
         "id":          int(os.getenv("MRED_ID", 0)),
-        "description": "Music Recurrent Editor & Dump — eksploracja muzyki przez Spotify",
-        "commands":    ["/search", "/artist", "/album", "/recommend", "/genres", "/new"],
-        "keywords":    ["muzyka", "music", "spotify", "piosenka", "artysta", "album", "gatunek"],
+        "description": "Music Recurrent Editor & Dump — eksploracja muzyki przez Last.fm",
+        "commands":    ["/search", "/artist", "/toptracks", "/album", "/similar", "/topcharts", "/tag"],
+        "keywords":    ["muzyka", "music", "lastfm", "piosenka", "artysta", "album", "gatunek", "podobni"],
         "color":       0x1DB954,
         "emoji":       "🎵",
     },
