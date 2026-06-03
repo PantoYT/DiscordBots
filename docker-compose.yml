@@ -1,0 +1,95 @@
+# Runs the whole *red bot family in containers.
+#
+#   docker compose up -d --build      # start all
+#   docker compose logs -f vred       # tail one bot
+#   docker compose restart ared       # restart one bot
+#
+# NOTES
+#  - Each service loads its secrets from ./<Bot>/.env (env_file), injected at
+#    runtime. Secrets are NOT copied into the image (see .dockerignore).
+#  - Fred/Qred/Tred are git submodules without a local .env here — create
+#    ./Fred/.env, ./Qred/.env, ./Tred/.env (DISCORD_TOKEN, OWNER_ID, ...).
+#  - Vred (eduVulcan) keeps credentials.json + seen_exams.json. Its whole
+#    folder is bind-mounted so that state survives restarts. First run once:
+#      docker compose run --rm vred python register.py
+#  - otnaP's /status was written for local processes; in containers it may need
+#    adapting (e.g. ping each service) — left as-is for now.
+
+x-bot: &bot
+  restart: unless-stopped
+  stop_grace_period: 10s
+
+services:
+  fred:
+    <<: *bot
+    container_name: fred
+    build:
+      context: .
+      args: { BOT: Fred, PYTHON_VERSION: "3.14" }
+    env_file: ./Fred/.env
+
+  qred:
+    <<: *bot
+    container_name: qred
+    build:
+      context: .
+      args: { BOT: Qred, PYTHON_VERSION: "3.14" }
+    env_file: ./Qred/.env
+
+  tred:
+    <<: *bot
+    container_name: tred
+    build:
+      context: .
+      args: { BOT: Tred, PYTHON_VERSION: "3.14" }
+    env_file: ./Tred/.env
+
+  pred:
+    <<: *bot
+    container_name: pred
+    build:
+      context: .
+      args: { BOT: Pred, PYTHON_VERSION: "3.14" }
+    env_file: ./Pred/.env
+
+  rred:
+    <<: *bot
+    container_name: rred
+    build:
+      context: .
+      args: { BOT: Rred, PYTHON_VERSION: "3.14" }
+    env_file: ./Rred/.env
+
+  ared:
+    <<: *bot
+    container_name: ared
+    build:
+      context: .
+      args: { BOT: Ared, PYTHON_VERSION: "3.14" }
+    env_file: ./Ared/.env
+
+  mred:
+    <<: *bot
+    container_name: mred
+    build:
+      context: .
+      args: { BOT: Mred, PYTHON_VERSION: "3.14" }
+    env_file: ./Mred/.env
+
+  otnap:
+    <<: *bot
+    container_name: otnap
+    build:
+      context: .
+      args: { BOT: otnaP, PYTHON_VERSION: "3.14" }
+    env_file: ./otnaP/.env
+
+  vred:
+    <<: *bot
+    container_name: vred
+    build:
+      context: .
+      args: { BOT: Vred, PYTHON_VERSION: "3.12" }
+    env_file: ./Vred/.env
+    volumes:
+      - ./Vred:/app          # persist credentials.json + seen_exams.json
