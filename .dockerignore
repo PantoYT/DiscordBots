@@ -1,0 +1,9 @@
+# Never bake secrets or local junk into images
+**/.env
+**/credentials.json
+**/seen_exams.json
+**/.venv
+**/__pycache__
+**/*.log
+*.zip
+.git
