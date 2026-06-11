@@ -67,6 +67,24 @@ def last_progress_block() -> str:
     return ("## " + sections[-1]).strip()[:1500] if len(sections) > 1 else text[-1500:]
 
 
+def presence_text() -> str:
+    """Short custom status — reflects the latest Amberfall render so Cred isn't naked."""
+    shot = latest_milestone()
+    if shot:
+        return f"🌥️ Amberfall · {shot.stem}"
+    return "🌥️ Amberfall · /commands"
+
+
+async def refresh_presence() -> None:
+    try:
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.CustomActivity(name=presence_text()),
+        )
+    except discord.HTTPException:
+        pass
+
+
 def build_report() -> tuple[discord.Embed, discord.File | None]:
     embed = discord.Embed(
         title="🌥️  Amberfall — raport",
@@ -106,6 +124,7 @@ async def on_ready() -> None:
         await bot.tree.sync()
     except discord.HTTPException:
         pass
+    await refresh_presence()
     if not periodic_report.is_running():
         periodic_report.start()
     print(f"Cred online as {bot.user} — reporting every {INTERVAL_MIN} min")
@@ -114,6 +133,7 @@ async def on_ready() -> None:
 @tasks.loop(minutes=INTERVAL_MIN)
 async def periodic_report() -> None:
     heartbeat()
+    await refresh_presence()
     try:
         await deliver_report()
     except discord.HTTPException as e:
