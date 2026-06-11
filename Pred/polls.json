@@ -1,0 +1,15 @@
+{
+  "1512141703749042319": {
+    "question": "czy tobi jest milionerem",
+    "options": [
+      "tak",
+      "nie"
+    ],
+    "type": "multi",
+    "author_id": 708636900851843132,
+    "channel_id": 1276211130607603744,
+    "guild_id": 1276210874012537008,
+    "created_at": "2026-06-04T17:11:16.483568",
+    "ended": true
+  }
+}

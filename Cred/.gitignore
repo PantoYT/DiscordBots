@@ -1,0 +1,12 @@
+# Secrets — NEVER commit
+.env
+
+# venv / Python
+venv/
+__pycache__/
+*.pyc
+
+# runtime
+cred.alive
+*.log
+get-pip.py

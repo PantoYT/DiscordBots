@@ -88,7 +88,11 @@ OTNAP_COLOR = 0xF59E0B  # amber — orchestrator gold
 # ---------------------------------------------------------------------------
 
 OPENROUTER_URL    = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL  = "google/gemini-flash-1.5"  # darmowy model na OpenRouter
+# Model konfigurowalny przez .env — domyślnie darmowy Gemma 4 (Google).
+# Slugi modeli na OpenRouter bywają wycofywane (np. google/gemini-flash-1.5 →
+# 404 "No endpoints found"), więc trzymamy to w env, żeby zmiana nie wymagała
+# edycji kodu. Płatna alternatywa (realny Gemini, grosze): google/gemini-2.5-flash-lite
+OPENROUTER_MODEL  = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
 
 ai_enabled = bool(OPENROUTER_API_KEY)
 print(f"[otnaP] AI (/ask): {'enabled — ' + OPENROUTER_MODEL if ai_enabled else 'disabled (brak OPENROUTER_API_KEY)'}")
@@ -136,6 +140,32 @@ def keyword_route(query: str) -> list[str]:
         if any(kw in q for kw in data["keywords"]):
             matches.append(name)
     return matches
+
+
+def keyword_route_embed(query: str, note: str | None = None) -> discord.Embed:
+    """Embed z keyword-routingiem — używany przez /route oraz jako fallback /ask."""
+    prefix = f"{note}\n\n" if note else ""
+    matches = keyword_route(query)
+    if not matches:
+        return discord.Embed(
+            title="🤷 Nie znaleziono dopasowania",
+            description=f"{prefix}Żaden bot nie pasuje do: *{query}*\n\nUżyj `/bots` żeby przejrzeć wszystkie.",
+            color=0xFF6B6B,
+        )
+    embed = discord.Embed(
+        title="📡 Routing",
+        description=f"{prefix}Dla zapytania: *{query}*",
+        color=OTNAP_COLOR,
+    )
+    for name in matches:
+        data = BOTS[name]
+        cmds = " · ".join(f"`{c}`" for c in data["commands"][:3])
+        embed.add_field(
+            name=f"{data['emoji']} {name}",
+            value=f"{data['description']}\n{cmds}",
+            inline=False,
+        )
+    return embed
 
 # ---------------------------------------------------------------------------
 # Discord setup
@@ -243,54 +273,15 @@ async def slash_status(interaction: discord.Interaction):
 
 @bot.tree.command(name="route", description="Znajdź bota do swojego zadania (bez AI, keyword matching)")
 async def slash_route(interaction: discord.Interaction, zapytanie: str):
-    matches = keyword_route(zapytanie)
-
-    if not matches:
-        embed = discord.Embed(
-            title="🤷 Nie znaleziono dopasowania",
-            description=f"Żaden bot nie pasuje do: *{zapytanie}*\n\nSpróbuj `/ask` z Gemini AI lub `/bots` żeby przejrzeć wszystkie.",
-            color=0xFF6B6B,
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-
-    embed = discord.Embed(
-        title="📡 Routing",
-        description=f"Dla zapytania: *{zapytanie}*",
-        color=OTNAP_COLOR,
-    )
-    for name in matches:
-        data = BOTS[name]
-        cmds = " · ".join(f"`{c}`" for c in data["commands"][:3])
-        embed.add_field(
-            name=f"{data['emoji']} {name}",
-            value=f"{data['description']}\n{cmds}",
-            inline=False,
-        )
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=keyword_route_embed(zapytanie))
 
 
 @bot.tree.command(name="ask", description="Zapytaj otnaP co który bot potrafi (Gemini AI via OpenRouter)")
 async def slash_ask(interaction: discord.Interaction, zapytanie: str):
     if not ai_enabled:
-        # Fallback — keyword routing
-        matches = keyword_route(zapytanie)
-        if matches:
-            embed = discord.Embed(
-                title="📡 Routing (keyword)",
-                description=f"*(AI niedostępne — keyword matching)*\n\nDla: *{zapytanie}*",
-                color=OTNAP_COLOR,
-            )
-            for name in matches:
-                data = BOTS[name]
-                embed.add_field(name=f"{data['emoji']} {name}", value=data["description"], inline=False)
-        else:
-            embed = discord.Embed(
-                title="❓ Nie wiem",
-                description=f"Brak AI i keyword routing nie znalazł dopasowania.\nUżyj `/bots` żeby przejrzeć boty.",
-                color=0xFF6B6B,
-            )
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(
+            embed=keyword_route_embed(zapytanie, note="*(AI niedostępne — keyword matching)*")
+        )
         return
 
     await interaction.response.defer()
@@ -301,10 +292,15 @@ async def slash_ask(interaction: discord.Interaction, zapytanie: str):
             description=answer,
             color=OTNAP_COLOR,
         )
-        embed.set_footer(text=f"Gemini via OpenRouter • /bots dla pełnej listy")
+        embed.set_footer(text=f"{OPENROUTER_MODEL} via OpenRouter • /bots dla pełnej listy")
         await interaction.followup.send(embed=embed)
     except Exception as e:
-        await interaction.followup.send(f"❌ AI error: `{e}`")
+        # AI padło (np. model wycofany → 404) — degraduj do keyword routingu
+        # zamiast pokazywać userowi surowy błąd HTTP.
+        print(f"[otnaP] AI error, fallback to keyword routing: {e}")
+        await interaction.followup.send(
+            embed=keyword_route_embed(zapytanie, note="*(AI chwilowo niedostępne — keyword matching)*")
+        )
 
 
 @bot.tree.command(name="ping", description="Sprawdź latencję otnaP")
