@@ -9,3 +9,5 @@ credentials.json
 
 # Backupy botow - uruchamiane z folderow/submodulow, nie z zipow
 *.zip
+Ared/warnings.json
+*.json

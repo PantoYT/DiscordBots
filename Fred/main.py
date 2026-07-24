@@ -27,42 +27,29 @@ except OSError:
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
-EPIC_API_KEY = os.getenv("EPIC_API_KEY")
-EPIC_API_URL = "https://epic-games-store-free-games.p.rapidapi.com/free?country=PL"
-HEADERS = {
-    "x-rapidapi-key": EPIC_API_KEY,
-    "x-rapidapi-host": "epic-games-store-free-games.p.rapidapi.com"
-}
+# Epic's own public promotions endpoint — no API key, no rate limit.
+# (Replaces the old RapidAPI wrapper, whose ~60-calls/month free tier ran dry
+#  and left Fred silently erroring since early July.)
+EPIC_API_URL = (
+    "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions"
+    "?locale=pl-PL&country=PL&allowCountries=PL"
+)
+USER_AGENT = "Mozilla/5.0 (Fred free-games Discord bot)"
 
 BASE_DIR = pathlib.Path(__file__).parent
 POSTED_FILE = BASE_DIR / "posted_games.json"
 CHANNEL_NAME = "free-games"
 CET = pytz.timezone('Europe/Warsaw')
-API_CALL_LOG = BASE_DIR / "api_calls.json"
 
-# -------------------------------
-# API call tracking
-# -------------------------------
-def get_api_call_count():
-    try:
-        with open(API_CALL_LOG, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("count", 0), data.get("month", "")
-    except (FileNotFoundError, json.JSONDecodeError):
-        return 0, ""
-
-def increment_api_calls():
-    now = datetime.now(CET)
-    current_month = now.strftime("%Y-%m")
-    count, last_month = get_api_call_count()
-    if last_month != current_month:
-        count = 0
-    count += 1
-    tmp = API_CALL_LOG.parent / (API_CALL_LOG.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"count": count, "month": current_month}, f)
-    os.replace(tmp, API_CALL_LOG)
-    return count
+# --- Opt-in notification role (YAGPDB-style reaction menu) ---
+NOTIFY_ROLE_NAME = "Epic"
+NOTIFY_EMOJI = "🔔"
+NOTIFY_MENU_TEXT = (
+    "**🔔 Powiadomienia o darmowych grach**\n"
+    f"Kliknij {NOTIFY_EMOJI} poniżej, żeby dostać rolę **@{NOTIFY_ROLE_NAME}** "
+    "i ping, gdy pojawią się nowe darmowe gry z Epic Games.\n"
+    "Kliknij ponownie, żeby zrezygnować."
+)
 
 # -------------------------------
 # Discord bot setup
@@ -83,11 +70,13 @@ try:
         posted_upcoming = data.get("upcoming", [])
         last_daily_run = data.get("last_daily_run", None)
         message_ids = data.get("message_ids", {})  # { channel_id: { "current_header": id, "current_embeds": [...], ... } }
+        notify_state = data.get("notify", {})       # { guild_id: { "role_id": id, "menu_channel_id": id, "menu_message_id": id } }
 except (FileNotFoundError, json.JSONDecodeError):
     posted_games = []
     posted_upcoming = []
     last_daily_run = None
     message_ids = {}
+    notify_state = {}
 
 def save_posted():
     current_titles = {g.get("title") for g in posted_games}
@@ -98,7 +87,8 @@ def save_posted():
             "current": posted_games,
             "upcoming": clean_upcoming,
             "last_daily_run": last_daily_run,
-            "message_ids": message_ids
+            "message_ids": message_ids,
+            "notify": notify_state
         }, f, ensure_ascii=False, indent=2)
     os.replace(tmp, POSTED_FILE)
 
@@ -115,12 +105,9 @@ def get_free_game_channels():
 
 async def fetch_games():
     try:
-        call_count = increment_api_calls()
-        print(f"API call #{call_count}/60")
-        if call_count > 58:
-            print("WARNING: Approaching API limit!")
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
+        timeout = aiohttp.ClientTimeout(total=15)
+        headers = {"User-Agent": USER_AGENT}
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             async with session.get(EPIC_API_URL) as resp:
                 if resp.status != 200:
                     print(f"API error: {resp.status}")
@@ -129,6 +116,66 @@ async def fetch_games():
     except Exception as e:
         print(f"Error fetching games: {e}")
         return None
+
+# -------------------------------
+# Parse Epic's public promotions payload into current/upcoming free games.
+# "Free" == an offer whose discountPercentage is 0 (you pay 0% of the price).
+# Discounted-but-not-free promos (-20%, -50%, …) are deliberately excluded.
+# -------------------------------
+def _page_slug(g):
+    for m in (g.get("catalogNs") or {}).get("mappings") or []:
+        if m.get("pageSlug"):
+            return m["pageSlug"]
+    for m in g.get("offerMappings") or []:
+        if m.get("pageSlug"):
+            return m["pageSlug"]
+    return g.get("productSlug") or g.get("urlSlug")
+
+def _free_offer(g, upcoming=False):
+    promo = g.get("promotions") or {}
+    key = "upcomingPromotionalOffers" if upcoming else "promotionalOffers"
+    for block in promo.get(key) or []:
+        for offer in block.get("promotionalOffers") or []:
+            pct = (offer.get("discountSetting") or {}).get("discountPercentage")
+            if pct == 0:
+                return offer
+    return None
+
+def _normalize(g, offer, upcoming=False):
+    """Reshape a raw Epic element into the dict shape make_embeds expects."""
+    entry = {
+        "title": g.get("title", "Unknown Game"),
+        "description": g.get("description", "No description"),
+        "seller": {"name": (g.get("seller") or {}).get("name", "Unknown")},
+        "urlSlug": _page_slug(g),
+        "keyImages": g.get("keyImages", []),
+    }
+    if upcoming:
+        entry["effectiveDate"] = offer.get("startDate")
+    else:
+        entry["promotions"] = {
+            "promotionalOffers": [{"promotionalOffers": [{"endDate": offer.get("endDate")}]}]
+        }
+    return entry
+
+def parse_free_games(data):
+    elements = (
+        ((data or {}).get("data") or {})
+        .get("Catalog", {})
+        .get("searchStore", {})
+        .get("elements", [])
+    ) or []
+    current, upcoming = [], []
+    for g in elements:
+        cur_offer = _free_offer(g, upcoming=False)
+        total = (g.get("price") or {}).get("totalPrice") or {}
+        if cur_offer and total.get("discountPrice") == 0:
+            current.append(_normalize(g, cur_offer, upcoming=False))
+            continue
+        up_offer = _free_offer(g, upcoming=True)
+        if up_offer:
+            upcoming.append(_normalize(g, up_offer, upcoming=True))
+    return current, upcoming
 
 def make_embeds(games, ctx_mention=None, upcoming=False, wide_image=False):
     embeds = []
@@ -144,7 +191,7 @@ def make_embeds(games, ctx_mention=None, upcoming=False, wide_image=False):
             date_field = g.get("effectiveDate", "Unknown start")
             if date_field:
                 try:
-                    dt = datetime.fromisoformat(date_field.replace("Z", "+00:00")) + timedelta(hours=1)
+                    dt = datetime.fromisoformat(date_field.replace("Z", "+00:00")).astimezone(CET)
                     date_field = dt.strftime("%Y-%m-%d %H:%M")
                 except:
                     pass
@@ -154,7 +201,7 @@ def make_embeds(games, ctx_mention=None, upcoming=False, wide_image=False):
                 end_raw = promos[0]["promotionalOffers"][0].get("endDate")
                 if end_raw:
                     try:
-                        dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00")) + timedelta(hours=1)
+                        dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).astimezone(CET)
                         date_field = dt.strftime("%Y-%m-%d %H:%M")
                     except:
                         pass
@@ -193,10 +240,12 @@ def are_games_same(new_games, old_games):
 # -------------------------------
 # Core: send or edit messages in channel
 # -------------------------------
-async def update_channel_messages(channel, current_games, upcoming_games, ctx_mention=None):
+async def update_channel_messages(channel, current_games, upcoming_games, ctx_mention=None, ping=False):
     """
     Edits existing messages if possible, otherwise sends new ones.
     Deletes extra stale messages when game count decreases.
+    When ping=True and there are current games, drops a fresh @role ping so
+    opted-in members actually get notified (a silent edit doesn't ping anyone).
     """
     global message_ids
 
@@ -271,6 +320,27 @@ async def update_channel_messages(channel, current_games, upcoming_games, ctx_me
             await delete_message(old_id)
         ids["upcoming_embeds"] = []
 
+    # --- New-games ping ---
+    # Only fires when the current set actually changed (weekly rotation), never on
+    # the daily no-op reconcile. Posts a fresh message at the bottom of the channel
+    # so it bumps + notifies; the board above stays edited-in-place.
+    guild_key = str(channel.guild.id)
+    notify = notify_state.get(guild_key, {})
+    role_id = notify.get("role_id")
+    if ping and role_id and current_games:
+        old_ping = ids.get("ping")
+        if old_ping:
+            await delete_message(old_ping)
+        try:
+            ping_msg = await channel.send(
+                f"<@&{role_id}> 🔔 **Nowe darmowe gry w tym tygodniu!** "
+                "Zgarnij zanim znikną 👇",
+                allowed_mentions=discord.AllowedMentions(roles=True)
+            )
+            ids["ping"] = ping_msg.id
+        except discord.HTTPException as e:
+            print(f"Failed to send ping in #{channel.name}: {e}")
+
     message_ids[channel_key] = ids
 
     # --- Reconcile: remove any leftover/untracked bot messages so the channel
@@ -285,6 +355,11 @@ async def update_channel_messages(channel, current_games, upcoming_games, ctx_me
     if ids.get("upcoming_header"):
         live_ids.add(ids["upcoming_header"])
     live_ids.update(ids.get("upcoming_embeds", []))
+    if ids.get("ping"):
+        live_ids.add(ids["ping"])
+    # Never delete the opt-in role menu that lives in this channel.
+    if notify.get("menu_channel_id") == channel.id and notify.get("menu_message_id"):
+        live_ids.add(notify["menu_message_id"])
 
     try:
         async for msg in channel.history(limit=500):
@@ -317,8 +392,12 @@ async def run_check(ctx_mention=None, force=False, interaction_channel=None, is_
         print("No channels found to post to")
         return False
 
-    current_games = data.get("currentGames", [])
-    next_games = data.get("nextGames", [])
+    current_games, next_games = parse_free_games(data)
+    if not current_games and not next_games:
+        # Successful HTTP call but nothing parsed — treat as a fetch failure so we
+        # keep the last good board instead of wiping it to an empty channel.
+        print("No free games parsed from API response — keeping previous state")
+        return False
     current_titles = {g.get("title") for g in current_games}
 
     games_changed = not are_games_same(current_games, posted_games)
@@ -346,13 +425,106 @@ async def run_check(ctx_mention=None, force=False, interaction_channel=None, is_
 
     for channel in channels:
         try:
-            await update_channel_messages(channel, current_games, posted_upcoming, ctx_mention=ctx_mention)
+            await update_channel_messages(
+                channel, current_games, posted_upcoming,
+                ctx_mention=ctx_mention, ping=games_changed
+            )
             save_posted()  # save updated message_ids after each channel
             print(f"Updated {channel.guild.name} - #{channel.name}")
         except Exception as e:
             print(f"Failed to update {channel.guild.name} - #{channel.name}: {e}")
 
     return True
+
+# -------------------------------
+# Opt-in notification role (reaction menu)
+# -------------------------------
+async def ensure_notify(guild, channel):
+    """Make sure the ping role and its reaction menu exist for this guild."""
+    gkey = str(guild.id)
+    st = notify_state.get(gkey, {})
+
+    # --- Role ---
+    role = guild.get_role(st["role_id"]) if st.get("role_id") else None
+    if role is None:
+        role = discord.utils.get(guild.roles, name=NOTIFY_ROLE_NAME)
+    if role is None:
+        if guild.me.guild_permissions.manage_roles:
+            try:
+                role = await guild.create_role(
+                    name=NOTIFY_ROLE_NAME, mentionable=True,
+                    reason="Fred free-games notification opt-in"
+                )
+            except discord.HTTPException as e:
+                print(f"Could not create role in {guild.name}: {e}")
+        else:
+            print(f"WARNING: no 'Manage Roles' permission in {guild.name} — skipping notify role")
+    if role:
+        st["role_id"] = role.id
+
+    # --- Reaction menu message ---
+    msg = None
+    if st.get("menu_message_id"):
+        try:
+            menu_channel = guild.get_channel(st.get("menu_channel_id")) or channel
+            msg = await menu_channel.fetch_message(st["menu_message_id"])
+        except (discord.NotFound, discord.HTTPException):
+            msg = None
+    if msg is None:
+        try:
+            msg = await channel.send(NOTIFY_MENU_TEXT)
+            await msg.add_reaction(NOTIFY_EMOJI)
+            try:
+                await msg.pin()
+            except discord.HTTPException:
+                pass
+        except discord.HTTPException as e:
+            print(f"Could not post notify menu in {guild.name}: {e}")
+    if msg:
+        st["menu_channel_id"] = msg.channel.id
+        st["menu_message_id"] = msg.id
+
+    notify_state[gkey] = st
+    save_posted()
+
+async def _toggle_notify_role(guild, user_id, message_id, emoji, add):
+    if str(emoji) != NOTIFY_EMOJI:
+        return
+    st = notify_state.get(str(guild.id))
+    if not st or message_id != st.get("menu_message_id"):
+        return
+    role = guild.get_role(st.get("role_id")) if st.get("role_id") else None
+    if role is None:
+        return
+    try:
+        member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+    except discord.HTTPException:
+        return
+    if member.bot:
+        return
+    try:
+        if add:
+            await member.add_roles(role, reason="free-games opt-in")
+        else:
+            await member.remove_roles(role, reason="free-games opt-out")
+    except discord.HTTPException as e:
+        print(f"Role toggle failed for {user_id}: {e}")
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    if payload.guild_id is None or payload.user_id == bot.user.id:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild:
+        await _toggle_notify_role(guild, payload.user_id, payload.message_id, payload.emoji, add=True)
+
+@bot.event
+async def on_raw_reaction_remove(payload):
+    if payload.guild_id is None:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild:
+        await _toggle_notify_role(guild, payload.user_id, payload.message_id, payload.emoji, add=False)
 
 # -------------------------------
 # Events
@@ -374,6 +546,10 @@ async def on_ready():
                 detected_channels.append(channel.id)
                 channel_found = True
                 print(f"Found channel '{CHANNEL_NAME}' in {guild.name} (ID: {channel.id})")
+                try:
+                    await ensure_notify(guild, channel)
+                except Exception as e:
+                    print(f"ensure_notify failed for {guild.name}: {e}")
                 break
         if not channel_found:
             guilds_without_channel.append(guild)
@@ -411,7 +587,11 @@ async def on_ready():
     print(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S CET')}")
     print(f"Last daily run: {last_daily_run}")
 
-    if now >= target_time and last_daily_run != today_str:
+    if os.getenv("FRED_FORCE_CHECK") == "1":
+        print("FRED_FORCE_CHECK=1 — forcing a check on startup")
+        result = await run_check(is_auto_check=True)
+        print("Forced startup check completed" if result else "Forced startup check failed")
+    elif now >= target_time and last_daily_run != today_str:
         print("Bot started after 17:01 and check hasn't run today - running now")
         result = await run_check(is_auto_check=True)
         print("Startup check completed" if result else "Startup check failed")
@@ -426,6 +606,7 @@ async def on_ready():
 @bot.tree.command(name="commands", description="Show all available commands")
 async def commands_slash(interaction: discord.Interaction):
     embed = discord.Embed(title="Fred - Epic Games Tracker", description="Track free Epic Games automatically.", color=0x1E3A8A)
+    embed.add_field(name="🔔 Powiadomienia", value=f"Kliknij {NOTIFY_EMOJI} pod przypiętym menu w #free-games, żeby dostawać pingi o nowych grach.", inline=False)
     embed.add_field(name="/current", value="Show current free games", inline=False)
     embed.add_field(name="/upcoming", value="Show upcoming free games", inline=False)
     embed.add_field(name="/next", value="Time until next check", inline=False)
@@ -528,6 +709,7 @@ async def setup_slash(interaction: discord.Interaction):
         welcome_embed = discord.Embed(title="Welcome to Free Games", description="Daily Epic Games Store updates at 17:01 CET", color=0x1E3A8A)
         welcome_embed.add_field(name="Quick Commands", value="`/current` - Current games\n`/upcoming` - Upcoming games\n`/commands` - All commands", inline=False)
         await new_channel.send(embed=welcome_embed)
+        await ensure_notify(guild, new_channel)
         print(f"Created channel '{CHANNEL_NAME}' in {guild.name}")
     except Exception as e:
         await interaction.response.send_message(f"Failed to create channel: {e}", ephemeral=True)
@@ -553,9 +735,15 @@ async def cleanup_slash(interaction: discord.Interaction):
             except (discord.NotFound, discord.HTTPException):
                 pass
 
-    # Reset tracked IDs for this channel
+    # Reset tracked IDs for this channel; the reaction menu was deleted above,
+    # so drop its stored id too and let ensure_notify repost + re-pin it.
     message_ids[channel_key] = {}
+    gkey = str(channel.guild.id)
+    if gkey in notify_state:
+        notify_state[gkey].pop("menu_message_id", None)
+        notify_state[gkey].pop("menu_channel_id", None)
     save_posted()
+    await ensure_notify(channel.guild, channel)
 
     await interaction.followup.send(f"Deleted {deleted} old messages. Running fresh check...", ephemeral=True)
     result = await run_check(ctx_mention=interaction.user.mention, force=True, interaction_channel=channel, is_auto_check=False)
