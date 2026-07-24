@@ -8,15 +8,16 @@ Sub LaunchVbs(path)
     End If
 End Sub
 
-' Stare boty (własne lokalizacje)
+' === Aktywne boty: tylko Fred, Qred, Vred ===
+' (Cred chodzi osobno na serwerze przez run.sh/keepalive.sh, nie z tego vbs.)
 LaunchVbs "E:\Pliki\Projects\DiscordBots\Fred\fred_launch.vbs"
 LaunchVbs "E:\Pliki\Projects\DiscordBots\Qred\qred_launch.vbs"
-LaunchVbs "E:\Pliki\Projects\DiscordBots\Tred\tred_launch.vbs"
 LaunchVbs "E:\Pliki\Projects\DiscordBots\Vred\vred_launch.vbs"
 
-' Nowe boty (DiscordBots\*)
-LaunchVbs "E:\Pliki\Projects\DiscordBots\Pred\pred_launch.vbs"
-LaunchVbs "E:\Pliki\Projects\DiscordBots\Rred\rred_launch.vbs"
-LaunchVbs "E:\Pliki\Projects\DiscordBots\Ared\ared_launch.vbs"
-LaunchVbs "E:\Pliki\Projects\DiscordBots\Mred\mred_launch.vbs"
-LaunchVbs "E:\Pliki\Projects\DiscordBots\otnaP\otnap_launch.vbs"
+' === Zaparkowane (odpięte od utrzymania 2026-07-24). Odkomentuj, by wrócić. ===
+' LaunchVbs "E:\Pliki\Projects\DiscordBots\Tred\tred_launch.vbs"
+' LaunchVbs "E:\Pliki\Projects\DiscordBots\Pred\pred_launch.vbs"
+' LaunchVbs "E:\Pliki\Projects\DiscordBots\Rred\rred_launch.vbs"
+' LaunchVbs "E:\Pliki\Projects\DiscordBots\Ared\ared_launch.vbs"
+' LaunchVbs "E:\Pliki\Projects\DiscordBots\Mred\mred_launch.vbs"
+' LaunchVbs "E:\Pliki\Projects\DiscordBots\otnaP\otnap_launch.vbs"
