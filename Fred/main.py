@@ -5,7 +5,7 @@ import os
 import pathlib
 import socket
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import asyncio
 import pytz
@@ -20,6 +20,12 @@ try:
 except OSError:
     print("[Fred] Another instance is already running — exiting.")
     raise SystemExit(0)
+
+
+def log(*parts):
+    """Timestamped, flushed output — fred_launch.vbs appends this to fred.log."""
+    stamp = datetime.now(pytz.timezone("Europe/Warsaw")).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{stamp}]", *parts, flush=True)
 
 # -------------------------------
 # Load environment
@@ -71,12 +77,14 @@ try:
         last_daily_run = data.get("last_daily_run", None)
         message_ids = data.get("message_ids", {})  # { channel_id: { "current_header": id, "current_embeds": [...], ... } }
         notify_state = data.get("notify", {})       # { guild_id: { "role_id": id, "menu_channel_id": id, "menu_message_id": id } }
+        ping_titles = set(data.get("ping_titles", []))  # title set the last @role ping announced
 except (FileNotFoundError, json.JSONDecodeError):
     posted_games = []
     posted_upcoming = []
     last_daily_run = None
     message_ids = {}
     notify_state = {}
+    ping_titles = set()
 
 def save_posted():
     current_titles = {g.get("title") for g in posted_games}
@@ -88,7 +96,8 @@ def save_posted():
             "upcoming": clean_upcoming,
             "last_daily_run": last_daily_run,
             "message_ids": message_ids,
-            "notify": notify_state
+            "notify": notify_state,
+            "ping_titles": sorted(ping_titles)
         }, f, ensure_ascii=False, indent=2)
     os.replace(tmp, POSTED_FILE)
 
@@ -110,11 +119,11 @@ async def fetch_games():
         async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             async with session.get(EPIC_API_URL) as resp:
                 if resp.status != 200:
-                    print(f"API error: {resp.status}")
+                    log(f"API error: {resp.status}")
                     return None
                 return await resp.json()
     except Exception as e:
-        print(f"Error fetching games: {e}")
+        log(f"Error fetching games: {e}")
         return None
 
 # -------------------------------
@@ -131,32 +140,62 @@ def _page_slug(g):
             return m["pageSlug"]
     return g.get("productSlug") or g.get("urlSlug")
 
-def _free_offer(g, upcoming=False):
+def _parse_dt(raw):
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+def _free_windows(g):
+    """All 100%-off windows for a game, as (start, end, offer) tuples.
+
+    Both promotion keys are scanned: Epic is not consistent about which bucket a
+    promo lands in near a rotation, and the window itself is what decides
+    whether a game is free right now — not the key it arrived under.
+    """
     promo = g.get("promotions") or {}
-    key = "upcomingPromotionalOffers" if upcoming else "promotionalOffers"
-    for block in promo.get(key) or []:
-        for offer in block.get("promotionalOffers") or []:
-            pct = (offer.get("discountSetting") or {}).get("discountPercentage")
-            if pct == 0:
-                return offer
-    return None
+    windows = []
+    for key in ("promotionalOffers", "upcomingPromotionalOffers"):
+        for block in promo.get(key) or []:
+            for offer in block.get("promotionalOffers") or []:
+                if (offer.get("discountSetting") or {}).get("discountPercentage") != 0:
+                    continue
+                start = _parse_dt(offer.get("startDate"))
+                end = _parse_dt(offer.get("endDate"))
+                if start and end:
+                    windows.append((start, end, offer))
+    return windows
+
+def _free_offer(g, upcoming=False):
+    """Pick the offer that is actually relevant *now*.
+
+    A game usually ships several offer blocks (one that already ended, the live
+    one, sometimes a future one). Taking the first free block — as this used to —
+    printed whichever date happened to come first in the payload, which is how
+    stale/wrong "Available Until" dates ended up on the board. Match on the
+    window instead: the one containing now, or the soonest one still ahead.
+    """
+    now = datetime.now(timezone.utc)
+    windows = _free_windows(g)
+    if upcoming:
+        future = [w for w in windows if w[0] > now]
+        return min(future, key=lambda w: w[0])[2] if future else None
+    live = [w for w in windows if w[0] <= now < w[1]]
+    return min(live, key=lambda w: w[1])[2] if live else None
 
 def _normalize(g, offer, upcoming=False):
     """Reshape a raw Epic element into the dict shape make_embeds expects."""
-    entry = {
+    return {
         "title": g.get("title", "Unknown Game"),
         "description": g.get("description", "No description"),
         "seller": {"name": (g.get("seller") or {}).get("name", "Unknown")},
         "urlSlug": _page_slug(g),
         "keyImages": g.get("keyImages", []),
+        "startDate": offer.get("startDate"),
+        "endDate": offer.get("endDate"),
     }
-    if upcoming:
-        entry["effectiveDate"] = offer.get("startDate")
-    else:
-        entry["promotions"] = {
-            "promotionalOffers": [{"promotionalOffers": [{"endDate": offer.get("endDate")}]}]
-        }
-    return entry
 
 def parse_free_games(data):
     elements = (
@@ -168,43 +207,45 @@ def parse_free_games(data):
     current, upcoming = [], []
     for g in elements:
         cur_offer = _free_offer(g, upcoming=False)
-        total = (g.get("price") or {}).get("totalPrice") or {}
-        if cur_offer and total.get("discountPrice") == 0:
+        if cur_offer:
             current.append(_normalize(g, cur_offer, upcoming=False))
             continue
         up_offer = _free_offer(g, upcoming=True)
         if up_offer:
             upcoming.append(_normalize(g, up_offer, upcoming=True))
+    # Stable order: the board reuses message slots positionally, so an unsorted
+    # list from the API would silently swap two games' embeds between runs.
+    current.sort(key=lambda g: (g.get("endDate") or "", g.get("title") or ""))
+    upcoming.sort(key=lambda g: (g.get("startDate") or "", g.get("title") or ""))
     return current, upcoming
+
+def _local(raw):
+    dt = _parse_dt(raw)
+    return dt.astimezone(CET).strftime("%Y-%m-%d %H:%M") if dt else None
+
+def _legacy_end(g):
+    """endDate as stored by pre-2026-08 builds, for state cached before the fix."""
+    promos = (g.get("promotions") or {}).get("promotionalOffers") or []
+    if promos and promos[0].get("promotionalOffers"):
+        return promos[0]["promotionalOffers"][0].get("endDate")
+    return None
 
 def make_embeds(games, ctx_mention=None, upcoming=False, wide_image=False):
     embeds = []
     for g in games:
-        title = g.get("title", "Unknown Game")
-        desc = g.get("description", "No description")
-        seller = g.get("seller", {}).get("name", "Unknown")
+        title = g.get("title") or "Unknown Game"
+        desc = g.get("description") or "No description"
+        seller = (g.get("seller") or {}).get("name") or "Unknown"
         slug = g.get("urlSlug")
         url = f"https://www.epicgames.com/store/p/{slug}" if slug else "No link"
 
-        date_field = None
+        start = _local(g.get("startDate") or g.get("effectiveDate"))
+        end = _local(g.get("endDate") or _legacy_end(g))
         if upcoming:
-            date_field = g.get("effectiveDate", "Unknown start")
-            if date_field:
-                try:
-                    dt = datetime.fromisoformat(date_field.replace("Z", "+00:00")).astimezone(CET)
-                    date_field = dt.strftime("%Y-%m-%d %H:%M")
-                except:
-                    pass
+            # Show the whole window ("from → until"), like Epic's own store widget.
+            date_field = f"{start} → {end}" if start and end else start
         else:
-            promos = g.get("promotions", {}).get("promotionalOffers", [])
-            if promos and promos[0].get("promotionalOffers"):
-                end_raw = promos[0]["promotionalOffers"][0].get("endDate")
-                if end_raw:
-                    try:
-                        dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).astimezone(CET)
-                        date_field = dt.strftime("%Y-%m-%d %H:%M")
-                    except:
-                        pass
+            date_field = end
 
         image_url = None
         thumbnail_url = None
@@ -218,10 +259,13 @@ def make_embeds(games, ctx_mention=None, upcoming=False, wide_image=False):
         if wide_image and not image_url:
             image_url = thumbnail_url
 
-        embed = discord.Embed(title=title, url=url, description=desc, color=0x1E3A8A)
+        embed = discord.Embed(title=title[:256], url=url, description=desc[:4000], color=0x1E3A8A)
         embed.add_field(name="Seller", value=seller, inline=True)
         if date_field:
-            label = "Available From" if upcoming else "Available Until"
+            if not upcoming:
+                label = "Available Until"
+            else:
+                label = "Available" if (start and end) else "Available From"
             embed.add_field(name=label, value=date_field, inline=True)
         if wide_image and image_url:
             embed.set_image(url=image_url)
@@ -231,11 +275,6 @@ def make_embeds(games, ctx_mention=None, upcoming=False, wide_image=False):
             embed.set_footer(text=f"Checked by {ctx_mention}")
         embeds.append(embed)
     return embeds
-
-def are_games_same(new_games, old_games):
-    new_titles = {g.get("title") for g in new_games}
-    old_titles = {g.get("title") for g in old_games}
-    return new_titles == old_titles
 
 # -------------------------------
 # Core: send or edit messages in channel
@@ -261,6 +300,31 @@ async def update_channel_messages(channel, current_games, upcoming_games, ctx_me
             await msg.delete()
         except (discord.NotFound, discord.HTTPException):
             pass
+
+    # --- Layout check -------------------------------------------------------
+    # Discord can only append, never insert. So when a game is added mid-week
+    # the extra embed used to be sent to the *bottom* of the channel — below the
+    # "Upcoming" section — and the board stayed scrambled from then on. If the
+    # tracked ids can no longer render the board top-to-bottom in the right
+    # order, tear the whole thing down and repost it in one clean pass.
+    seq = [ids.get("current_header"), *ids.get("current_embeds", [])[:len(embeds_current)]]
+    if embeds_upcoming:
+        seq += [ids.get("upcoming_header"), *ids.get("upcoming_embeds", [])[:len(embeds_upcoming)]]
+    expected_len = 1 + len(embeds_current) + (1 + len(embeds_upcoming) if embeds_upcoming else 0)
+    in_order = (
+        len(seq) == expected_len
+        and all(seq)
+        and all(a < b for a, b in zip(seq, seq[1:]))
+    )
+    if not in_order:
+        log(f"#{channel.name}: board out of order or incomplete — reposting from scratch")
+        for msg_id in [
+            ids.get("current_header"), ids.get("upcoming_header"), ids.get("ping"),
+            *ids.get("current_embeds", []), *ids.get("upcoming_embeds", []),
+        ]:
+            if msg_id:
+                await delete_message(msg_id)
+        ids = {}
 
     async def edit_or_send(existing_id, content=None, embed=None):
         if existing_id:
@@ -339,7 +403,7 @@ async def update_channel_messages(channel, current_games, upcoming_games, ctx_me
             )
             ids["ping"] = ping_msg.id
         except discord.HTTPException as e:
-            print(f"Failed to send ping in #{channel.name}: {e}")
+            log(f"Failed to send ping in #{channel.name}: {e}")
 
     message_ids[channel_key] = ids
 
@@ -376,11 +440,11 @@ async def update_channel_messages(channel, current_games, upcoming_games, ctx_me
 # Main check logic
 # -------------------------------
 async def run_check(ctx_mention=None, force=False, interaction_channel=None, is_auto_check=False):
-    global last_daily_run, posted_games, posted_upcoming
+    global last_daily_run, posted_games, posted_upcoming, ping_titles
 
     data = await fetch_games()
     if not data:
-        print("Failed to fetch games")
+        log("Failed to fetch games")
         return False
 
     if interaction_channel:
@@ -389,18 +453,31 @@ async def run_check(ctx_mention=None, force=False, interaction_channel=None, is_
         channels = get_free_game_channels()
 
     if not channels:
-        print("No channels found to post to")
+        log("No channels found to post to")
         return False
 
     current_games, next_games = parse_free_games(data)
     if not current_games and not next_games:
         # Successful HTTP call but nothing parsed — treat as a fetch failure so we
         # keep the last good board instead of wiping it to an empty channel.
-        print("No free games parsed from API response — keeping previous state")
+        log("No free games parsed from API response — keeping previous state")
         return False
     current_titles = {g.get("title") for g in current_games}
+    log(f"Parsed current={sorted(current_titles)} upcoming={sorted(g.get('title') for g in next_games)}")
 
-    games_changed = not are_games_same(current_games, posted_games)
+    previous_titles = {g.get("title") for g in posted_games}
+    games_changed = current_titles != previous_titles
+
+    # Ping only for genuinely new titles, and never twice for the same line-up.
+    # `games_changed` alone was too loose: a check that landed mid-rotation (or
+    # after a state reset) saw a shrunken list, saved it, and the next run read
+    # as "changed" — pinging @Epic about games everyone had already been told
+    # about. ping_titles survives in posted_games.json, so it holds across
+    # restarts.
+    should_ping = bool(current_games) and bool(current_titles - previous_titles) and current_titles != ping_titles
+    if games_changed:
+        log(f"Line-up changed: +{sorted(current_titles - previous_titles)} "
+            f"-{sorted(previous_titles - current_titles)} | ping={should_ping}")
 
     # Manual /check with no changes: don't repost, just offer /confirm.
     # The daily auto-check deliberately falls through even when the game list is
@@ -417,22 +494,29 @@ async def run_check(ctx_mention=None, force=False, interaction_channel=None, is_
     posted_games = current_games.copy()
     # Use only what the API currently says is upcoming — don't accumulate historical entries
     posted_upcoming = [g for g in next_games if g.get("title") not in current_titles]
-
-    if is_auto_check:
-        last_daily_run = str(datetime.now(CET).date())
+    if should_ping:
+        ping_titles = set(current_titles)
 
     save_posted()
 
+    updated = 0
     for channel in channels:
         try:
             await update_channel_messages(
                 channel, current_games, posted_upcoming,
-                ctx_mention=ctx_mention, ping=games_changed
+                ctx_mention=ctx_mention, ping=should_ping
             )
             save_posted()  # save updated message_ids after each channel
-            print(f"Updated {channel.guild.name} - #{channel.name}")
+            updated += 1
+            log(f"Updated {channel.guild.name} - #{channel.name}")
         except Exception as e:
-            print(f"Failed to update {channel.guild.name} - #{channel.name}: {e}")
+            log(f"Failed to update {channel.guild.name} - #{channel.name}: {e}")
+
+    # Only mark the day done once a channel actually took the update — otherwise
+    # the 5-minute loop should keep retrying instead of skipping until tomorrow.
+    if is_auto_check and updated:
+        last_daily_run = str(datetime.now(CET).date())
+        save_posted()
 
     return True
 
@@ -456,9 +540,9 @@ async def ensure_notify(guild, channel):
                     reason="Fred free-games notification opt-in"
                 )
             except discord.HTTPException as e:
-                print(f"Could not create role in {guild.name}: {e}")
+                log(f"Could not create role in {guild.name}: {e}")
         else:
-            print(f"WARNING: no 'Manage Roles' permission in {guild.name} — skipping notify role")
+            log(f"WARNING: no 'Manage Roles' permission in {guild.name} — skipping notify role")
     if role:
         st["role_id"] = role.id
 
@@ -479,7 +563,7 @@ async def ensure_notify(guild, channel):
             except discord.HTTPException:
                 pass
         except discord.HTTPException as e:
-            print(f"Could not post notify menu in {guild.name}: {e}")
+            log(f"Could not post notify menu in {guild.name}: {e}")
     if msg:
         st["menu_channel_id"] = msg.channel.id
         st["menu_message_id"] = msg.id
@@ -508,7 +592,7 @@ async def _toggle_notify_role(guild, user_id, message_id, emoji, add):
         else:
             await member.remove_roles(role, reason="free-games opt-out")
     except discord.HTTPException as e:
-        print(f"Role toggle failed for {user_id}: {e}")
+        log(f"Role toggle failed for {user_id}: {e}")
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -533,8 +617,8 @@ async def on_raw_reaction_remove(payload):
 async def on_ready():
     global last_daily_run
     now = datetime.now(CET)
-    print(f"Bot logged in as {bot.user}")
-    print(f"Connected to {len(bot.guilds)} guilds")
+    log(f"Bot logged in as {bot.user}")
+    log(f"Connected to {len(bot.guilds)} guilds")
 
     detected_channels = []
     guilds_without_channel = []
@@ -545,15 +629,15 @@ async def on_ready():
             if channel.name == CHANNEL_NAME:
                 detected_channels.append(channel.id)
                 channel_found = True
-                print(f"Found channel '{CHANNEL_NAME}' in {guild.name} (ID: {channel.id})")
+                log(f"Found channel '{CHANNEL_NAME}' in {guild.name} (ID: {channel.id})")
                 try:
                     await ensure_notify(guild, channel)
                 except Exception as e:
-                    print(f"ensure_notify failed for {guild.name}: {e}")
+                    log(f"ensure_notify failed for {guild.name}: {e}")
                 break
         if not channel_found:
             guilds_without_channel.append(guild)
-            print(f"WARNING: No '{CHANNEL_NAME}' channel in {guild.name}")
+            log(f"WARNING: No '{CHANNEL_NAME}' channel in {guild.name}")
 
     for guild in guilds_without_channel:
         try:
@@ -568,13 +652,13 @@ async def on_ready():
                 embed.add_field(name="Option 2: Manual", value=f"Create a channel named `{CHANNEL_NAME}` yourself.", inline=False)
                 await target_channel.send(embed=embed)
         except Exception as e:
-            print(f"Could not send setup message to {guild.name}: {e}")
+            log(f"Could not send setup message to {guild.name}: {e}")
 
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands")
+        log(f"Synced {len(synced)} slash commands")
     except Exception as e:
-        print(f"Failed to sync commands: {e}")
+        log(f"Failed to sync commands: {e}")
 
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching,
@@ -584,19 +668,19 @@ async def on_ready():
     today_str = str(now.date())
     target_time = now.replace(hour=17, minute=1, second=0, microsecond=0)
 
-    print(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S CET')}")
-    print(f"Last daily run: {last_daily_run}")
+    log(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S CET')}")
+    log(f"Last daily run: {last_daily_run}")
 
     if os.getenv("FRED_FORCE_CHECK") == "1":
-        print("FRED_FORCE_CHECK=1 — forcing a check on startup")
+        log("FRED_FORCE_CHECK=1 — forcing a check on startup")
         result = await run_check(is_auto_check=True)
-        print("Forced startup check completed" if result else "Forced startup check failed")
+        log("Forced startup check completed" if result else "Forced startup check failed")
     elif now >= target_time and last_daily_run != today_str:
-        print("Bot started after 17:01 and check hasn't run today - running now")
+        log("Bot started after 17:01 and check hasn't run today - running now")
         result = await run_check(is_auto_check=True)
-        print("Startup check completed" if result else "Startup check failed")
+        log("Startup check completed" if result else "Startup check failed")
     else:
-        print(f"No startup check needed (last run: {last_daily_run})")
+        log(f"No startup check needed (last run: {last_daily_run})")
 
     daily_check.start()
 
@@ -710,7 +794,7 @@ async def setup_slash(interaction: discord.Interaction):
         welcome_embed.add_field(name="Quick Commands", value="`/current` - Current games\n`/upcoming` - Upcoming games\n`/commands` - All commands", inline=False)
         await new_channel.send(embed=welcome_embed)
         await ensure_notify(guild, new_channel)
-        print(f"Created channel '{CHANNEL_NAME}' in {guild.name}")
+        log(f"Created channel '{CHANNEL_NAME}' in {guild.name}")
     except Exception as e:
         await interaction.response.send_message(f"Failed to create channel: {e}", ephemeral=True)
 
@@ -761,24 +845,26 @@ async def shutdown_slash(interaction: discord.Interaction):
 # -------------------------------
 # Daily scheduled task at 17:01 CET
 # -------------------------------
-@tasks.loop(minutes=15)
+# Epic rotates at 17:00 CET; a 15-minute tick could leave the board up to a
+# quarter of an hour stale (and land the run in the middle of the rotation).
+@tasks.loop(minutes=5)
 async def daily_check():
     global last_daily_run
     now = datetime.now(CET)
     today_str = str(now.date())
     target_time = now.replace(hour=17, minute=1, second=0, microsecond=0)
     if now >= target_time and last_daily_run != today_str:
-        print(f"Running daily check at {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        log(f"Running daily check at {now.strftime('%Y-%m-%d %H:%M:%S')}")
         result = await run_check(is_auto_check=True)
         if result:
-            print(f"Daily check done. Next at 17:01 tomorrow.")
+            log("Daily check done. Next at 17:01 tomorrow.")
         else:
-            print("Daily check failed, will retry in 15 minutes")
+            log("Daily check failed, will retry in 5 minutes")
 
 @daily_check.before_loop
 async def before_daily_check():
     await bot.wait_until_ready()
-    print("Daily check task started - will run after 17:01 CET every day")
+    log("Daily check task started - will run after 17:01 CET every day")
 
 # -------------------------------
 # Run the bot
