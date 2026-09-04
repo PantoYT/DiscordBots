@@ -154,7 +154,8 @@ class VulcanClient:
         constituent_id = self._pupil.get("ConstituentUnit", {}).get("Id", 0)
         url = (
             f"{self._rest_url}/{self._symbol()}/api/mobile/school/lucky"
-            f"?unitId={self._unit_id()}&constituentId={constituent_id}&day={today}"
+            f"?unitId={self._unit_id()}&pupilId={self._pupil_id()}"
+            f"&constituentId={constituent_id}&day={today}"
         )
         try:
             return self._get(url)["Envelope"]["Number"]
