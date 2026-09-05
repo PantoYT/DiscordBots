@@ -176,6 +176,11 @@ def exam_embed(exam: dict) -> discord.Embed:
     return embed
 
 
+def lesson_date(lesson: dict) -> str | None:
+    """API przeszła z zagnieżdżonego Date.Date na płaskie DateAt — obsłuż oba."""
+    return lesson.get("DateAt") or lesson.get("Date", {}).get("Date")
+
+
 def lesson_line(lesson: dict) -> str:
     slot     = lesson.get("TimeSlot", {})
     pos      = slot.get("Position", "?")
@@ -202,6 +207,34 @@ def schedule_embed(lessons: list, date_str: str) -> discord.Embed:
     return embed
 
 
+WEEK_LABELS = {"poprzedni": "Poprzedni tydzień", "obecny": "Ten tydzień", "nastepny": "Następny tydzień"}
+
+
+def week_embed(lessons: list, monday: datetime, ktory: str) -> discord.Embed:
+    sunday = monday + timedelta(days=6)
+    embed = discord.Embed(
+        title=f"📅 {WEEK_LABELS.get(ktory, 'Plan tygodnia')} — "
+              f"{monday.strftime('%d.%m')}–{sunday.strftime('%d.%m.%Y')}",
+        color=VRED_COLOR,
+    )
+    by_date: dict[str, list] = {}
+    for l in lessons:
+        d = lesson_date(l)
+        if d:
+            by_date.setdefault(d, []).append(l)
+
+    for offset in range(7):
+        day = monday + timedelta(days=offset)
+        date_str = day.strftime("%Y-%m-%d")
+        day_lessons = sorted(by_date.get(date_str, []), key=lambda l: l.get("TimeSlot", {}).get("Position", 99))
+        name = f"{WEEKDAYS_PL[offset]} {day.strftime('%d.%m')}"
+        value = "\n".join(lesson_line(l) for l in day_lessons) if day_lessons else "Brak lekcji."
+        embed.add_field(name=name, value=value[:1024], inline=False)
+
+    embed.set_footer(text="Vred • eduVulcan bot")
+    return embed
+
+
 # ---------------------------------------------------------------------------
 # Daily schedule post
 # ---------------------------------------------------------------------------
@@ -224,7 +257,7 @@ async def daily_schedule():
         client   = get_client()
         lessons  = client.get_lessons(now, now)
         date_str = today
-        day      = [l for l in lessons if l.get("Date", {}).get("Date") == date_str]
+        day      = [l for l in lessons if lesson_date(l) == date_str]
         embed    = build_schedule_table(day, date_str)
         await post_or_edit_schedule(channel, embed)
     except Exception as e:
@@ -275,6 +308,7 @@ async def slash_commands(interaction: discord.Interaction):
     embed.add_field(name="/plan",        value="Plan lekcji na dziś",              inline=False)
     embed.add_field(name="/jutro",       value="Plan lekcji na jutro",             inline=False)
     embed.add_field(name="/dzien",       value="Plan lekcji na wybrany dzień (+N)", inline=False)
+    embed.add_field(name="/tydzien",     value="Plan lekcji na cały tydzień (poprzedni/obecny/następny)", inline=False)
     embed.add_field(name="/sprawdziany", value="Nadchodzące sprawdziany",          inline=False)
     embed.add_field(name="/nastepny",    value="Czas do następnego sprawdzianu",   inline=False)
     embed.add_field(name="/setup",       value="Utwórz kanały plan-lekcji i sprawdziany", inline=False)
@@ -293,7 +327,7 @@ async def slash_plan(interaction: discord.Interaction):
         date_str = target.strftime("%Y-%m-%d")
         client   = get_client()
         lessons  = client.get_lessons(target, target)
-        day      = [l for l in lessons if l.get("Date", {}).get("Date") == date_str]
+        day      = [l for l in lessons if lesson_date(l) == date_str]
         embed    = build_schedule_table(day, date_str)
         # Aktualizuj wiadomość na kanale plan-lekcji jeśli komenda tam wywołana
         if interaction.channel and interaction.channel.name == SCHEDULE_CHANNEL:
@@ -313,7 +347,7 @@ async def slash_jutro(interaction: discord.Interaction):
         date_str = target.strftime("%Y-%m-%d")
         client   = get_client()
         lessons  = client.get_lessons(target, target)
-        day      = [l for l in lessons if l.get("Date", {}).get("Date") == date_str]
+        day      = [l for l in lessons if lesson_date(l) == date_str]
         await interaction.followup.send(embed=schedule_embed(day, date_str))
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
@@ -327,8 +361,29 @@ async def slash_dzien(interaction: discord.Interaction, offset: int):
         date_str = target.strftime("%Y-%m-%d")
         client   = get_client()
         lessons  = client.get_lessons(target, target)
-        day      = [l for l in lessons if l.get("Date", {}).get("Date") == date_str]
+        day      = [l for l in lessons if lesson_date(l) == date_str]
         await interaction.followup.send(embed=schedule_embed(day, date_str))
+    except Exception as e:
+        await interaction.followup.send(f"❌ `{e}`")
+
+
+@bot.tree.command(name="tydzien", description="Plan lekcji na cały tydzień")
+@discord.app_commands.describe(ktory="Który tydzień pokazać")
+@discord.app_commands.choices(ktory=[
+    discord.app_commands.Choice(name="Poprzedni", value="poprzedni"),
+    discord.app_commands.Choice(name="Obecny", value="obecny"),
+    discord.app_commands.Choice(name="Następny", value="nastepny"),
+])
+async def slash_tydzien(interaction: discord.Interaction, ktory: str = "obecny"):
+    await interaction.response.defer()
+    try:
+        week_offset = {"poprzedni": -1, "obecny": 0, "nastepny": 1}.get(ktory, 0)
+        today  = datetime.now(CET)
+        monday = today - timedelta(days=today.weekday()) + timedelta(weeks=week_offset)
+        sunday = monday + timedelta(days=6)
+        client  = get_client()
+        lessons = client.get_lessons(monday, sunday)
+        await interaction.followup.send(embed=week_embed(lessons, monday, ktory))
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
 
@@ -493,7 +548,7 @@ async def rotate_status():
         # Slot 3: ile lekcji dziś
         date_str = now.strftime("%Y-%m-%d")
         lessons  = client.get_lessons(now, now)
-        today    = [l for l in lessons if l.get("Date", {}).get("Date") == date_str]
+        today    = [l for l in lessons if lesson_date(l) == date_str]
         if today:
             slots.append(f"📅 Dziś {len(today)} lekcji")
 
