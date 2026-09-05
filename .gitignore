@@ -6,6 +6,8 @@ __pycache__/
 # Sekrety / lokalna konfiguracja (siatka bezpieczenstwa na poziomie repo)
 .env
 credentials.json
+credentials.json.bak
+credentials.json.tmp
 
 # Backupy botow - uruchamiane z folderow/submodulow, nie z zipow
 *.zip
