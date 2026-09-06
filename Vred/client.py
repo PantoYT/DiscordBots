@@ -129,6 +129,19 @@ class VulcanClient:
                 return p["Id"]
         return self._pupil["Periods"][-1]["Id"]
 
+    @property
+    def periods(self) -> list:
+        return self._pupil.get("Periods", [])
+
+    def get_schedule_changes(self, date_from: str, date_to: str, period_id: int) -> list:
+        """schedule/withchanges — jak get_lessons, ale niesie Change (zastępstwo/odwołane)."""
+        url = (
+            f"{self._rest_url}/{self._symbol()}/api/mobile/schedule/withchanges/byPupil"
+            f"?unitId={self._unit_id()}&pupilId={self._pupil_id()}"
+            f"&periodId={period_id}&dateFrom={date_from}&dateTo={date_to}&pageSize=500"
+        )
+        return self._get(url)["Envelope"]
+
     def get_lessons(self, date_from: datetime, date_to: datetime) -> list:
         df = date_from.strftime("%Y-%m-%d")
         dt = date_to.strftime("%Y-%m-%d")

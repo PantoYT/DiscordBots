@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands, tasks
+import asyncio
 import os
 import json
 from datetime import datetime, timedelta
@@ -8,6 +9,7 @@ import pytz
 import requests as req
 
 from client import VulcanClient
+import calendar_sync
 
 load_dotenv()
 
@@ -21,8 +23,10 @@ CET               = pytz.timezone("Europe/Warsaw")
 SEEN_EXAMS_FILE   = "seen_exams.json"
 SCHEDULE_MSG_FILE = "schedule_message.json"
 DAILY_HOUR        = int(os.getenv("DAILY_HOUR", 7))
+CALENDAR_SYNC_HOUR = int(os.getenv("CALENDAR_SYNC_HOUR", 20))
 UPTIME_KUMA_URL   = os.getenv("UPTIME_KUMA_URL", "")
 last_schedule_run: str | None = None
+last_calendar_sync: str | None = None
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -266,6 +270,49 @@ async def daily_schedule():
 
 @daily_schedule.before_loop
 async def before_daily():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
+# Synchronizacja Google Calendar (kolorowy plan lekcji)
+# ---------------------------------------------------------------------------
+
+async def run_calendar_sync(reason: str):
+    """Blokujaca robota sieciowa calendar_sync.sync() w osobnym watku, zeby nie
+    zamrazac gateway'a Discorda. Przy wygasnieciu OAuth (Testing = ~7 dni)
+    wysyla DM do wlasciciela z instrukcja odnowienia."""
+    global last_calendar_sync
+    last_calendar_sync = datetime.now(CET).strftime("%Y-%m-%d")
+    try:
+        result = await asyncio.to_thread(calendar_sync.sync)
+        print(f"[calendar_sync:{reason}] {result}")
+    except calendar_sync.CalendarAuthError as e:
+        print(f"[calendar_sync:{reason}] AUTORYZACJA WYGASLA: {e}")
+        try:
+            owner = await bot.fetch_user(OWNER_ID)
+            await owner.send(
+                "📅 Synchronizacja kalendarza Google wygasła (tryb Testing, ~7 dni).\n"
+                "Odpal na PC: `py -3.12 calendar_auth.py` w folderze Vred, żeby odnowić."
+            )
+        except Exception as dm_err:
+            print(f"[calendar_sync:{reason}] nie udalo sie wyslac DM: {dm_err}")
+    except Exception as e:
+        print(f"[calendar_sync:{reason}] Blad: {e}")
+
+
+@tasks.loop(minutes=1)
+async def calendar_sync_task():
+    now = datetime.now(CET)
+    today = now.strftime("%Y-%m-%d")
+    if last_calendar_sync == today:
+        return
+    if now.hour < CALENDAR_SYNC_HOUR:
+        return
+    await run_calendar_sync("daily")
+
+
+@calendar_sync_task.before_loop
+async def before_calendar_sync():
     await bot.wait_until_ready()
 
 
@@ -652,6 +699,8 @@ async def on_ready():
     check_exams.start()
     rotate_status.start()
     uptime_ping.start()
+    calendar_sync_task.start()
+    asyncio.create_task(run_calendar_sync("startup"))
 
 
 # -------------------------------
