@@ -1,14 +1,21 @@
 """
 Synchronizuje plan lekcji (Hebe API) do dedykowanego kalendarza "Lekcje"
-w Google Calendar, z NAPRAWDĘ unikalnym kolorem per przedmiot.
+w Google Calendar, z kolorem per przedmiot.
 
-Google Calendar ma tylko 11 wbudowanych colorId — za mało na 15-20 przedmiotów
-bez powtórek. Zamiast tego używamy calendars.labelProperties.eventLabels
-(funkcja z czerwca 2026) — własne etykiety z dowolnym kolorem hex, do 200 na
-kalendarz, przypięte do wydarzenia przez eventLabelId. Każdy przedmiot dostaje
-kolor z 20-kolorowej palety wygenerowanej równomiernie na kole barw (HSL),
-wybrany stabilnym hashem nazwy — nowy przedmiot dostaje kolor automatycznie,
-a istniejące nie przeskakują koloru przy kolejnych synchronizacjach.
+WAŻNE (odkryte empirycznie, nie z dokumentacji): Google Calendar API
+udostępnia `calendars.labelProperties.eventLabels` (własne kolory hex, do 200
+na kalendarz) i dokumentacja nazywa `eventLabelId` polem zapisywalnym na
+Event — ale w praktyce PATCH z `eventLabelId` zwraca 200 i **nic nie zapisuje**
+(świeży GET po zapisie pokazuje puste pole). Sprawdzone wprost: PATCH →
+odczyt → brak zmiany. Nie polegać na tym polu, dopóki Google tego nie naprawi.
+
+Zamiast tego: klasyczne `colorId` (1-11, jedyne realnie zapisywalne pole
+koloru). Z 11 kolorów rezerwujemy 2 na zastępstwo/odwołanie i 1 wyrzucamy
+(Graphite = szary, wygląda jak brak koloru) — zostaje 8 na przedmioty. Za
+mało na 15-26 przedmiotów żeby każdy był unikalny, więc kolorujemy graf:
+przedmioty z tego samego dnia nigdy nie dostają tego samego koloru (zero
+kolizji tam, gdzie realnie by przeszkadzały), a te co nigdy się nie
+spotykają mogą spokojnie dzielić kolor.
 
 Wymaga google_calendar_token.json (patrz calendar_auth.py). Token jest
 z aplikacji w trybie Testing — wygasa po ~7 dniach; wtedy ta funkcja rzuca
@@ -20,10 +27,9 @@ tworzy duplikatów przy kolejnych synchronizacjach, aktualizuje zmienione
 """
 from __future__ import annotations
 
-import colorsys
-import hashlib
 import json
 import sys
+from collections import Counter, defaultdict
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -33,53 +39,55 @@ from client import VulcanClient
 
 ROOT = Path(__file__).resolve().parent
 TOKEN_FILE = ROOT / "google_calendar_token.json"
-LABELS_FILE = ROOT / "calendar_labels.json"
 CALENDAR_SUMMARY = "Lekcje"  # celowo inna nazwa niz "Plan lekcji" (ta jest zajeta przez subskrypcje .ics — tamta jest tylko-do-odczytu)
 CHUNK_DAYS = 28
 SOURCE_TAG = "vred"
 
-LABEL_CANCELLED = "Odwołane"
-LABEL_SUBST = "Zastępstwo"
-COLOR_CANCELLED = "#e53935"  # czerwony, poza pulą przedmiotow
-COLOR_SUBST = "#fb8c00"      # pomaranczowy, poza pulą przedmiotow
-
-PALETTE_SIZE = 24
-
-
-def _make_palette(n: int = PALETTE_SIZE, s: float = 0.62, l: float = 0.50) -> list[str]:
-    """N kolorow rownomiernie rozlozonych na kole barw — stala pula, zeby dodanie
-    nowego przedmiotu nigdy nie przesuwalo kolorow juz przypisanym innym."""
-    colors = []
-    for i in range(n):
-        r, g, b = colorsys.hls_to_rgb(i / n, l, s)
-        colors.append("#{:02x}{:02x}{:02x}".format(round(r * 255), round(g * 255), round(b * 255)))
-    return colors
+# Google Calendar colorId: 1 Lavender 2 Sage 3 Grape 4 Flamingo 5 Banana
+# 6 Tangerine 7 Peacock 8 Graphite 9 Blueberry 10 Basil 11 Tomato
+COLOR_CANCELLED = "11"   # Tomato
+COLOR_SUBST = "6"        # Tangerine
+SUBJECT_COLOR_IDS = ["1", "2", "3", "4", "5", "7", "9", "10"]  # bez 8 (szary) i bez rezerwowanych
 
 
-SUBJECT_PALETTE = _make_palette()
+def _assign_colors_graph(lessons: list[dict]) -> dict[str, str]:
+    """Koloruje przedmioty tak, zeby zaden dzien nie mial dwoch tej samej
+    barwy (graf konfliktow = 'wystepuja tego samego dnia'). Zachlanny
+    Welsh-Powell (od najbardziej 'zatloczonego' przedmiotu), deterministyczny
+    dzieki sortowaniu po nazwie przy remisach."""
+    day_subjects: dict[str, set[str]] = defaultdict(set)
+    all_subjects: set[str] = set()
+    for l in lessons:
+        if l.get("Visible") is False:
+            continue
+        subj = _lesson_subject(l)
+        d = l.get("DateAt")
+        if not d:
+            continue
+        day_subjects[d].add(subj)
+        all_subjects.add(subj)
 
+    adjacency: dict[str, set[str]] = defaultdict(set)
+    for subs in day_subjects.values():
+        subs = list(subs)
+        for i in range(len(subs)):
+            for j in range(i + 1, len(subs)):
+                adjacency[subs[i]].add(subs[j])
+                adjacency[subs[j]].add(subs[i])
 
-def _assign_colors(subjects: set[str]) -> dict[str, str]:
-    """Przydziela kolor kazdemu przedmiotowi z bieżącego zbioru, gwarantujac brak
-    kolizji. Paleta rosnie do liczby przedmiotow, gdy jest ich wiecej niz
-    PALETTE_SIZE — inaczej przy kolizji zabraklo by wolnego slotu (nieskonczona
-    petla). Start od stabilnego hashu nazwy, przy kolizji szuka najblizszego
-    wolnego slotu (deterministycznie, w kolejnosci alfabetycznej) — kolor moze
-    sie przesunac o pare przedmiotow gdy zbior przedmiotow sie zmieni (nowy
-    semestr), w zamian za zero powtorzen kolorow naraz. Świadomy kompromis:
-    unikalnosc teraz > stabilnosc w czasie."""
-    n = max(PALETTE_SIZE, len(subjects))
-    palette = SUBJECT_PALETTE if n == PALETTE_SIZE else _make_palette(n)
-    taken: set[int] = set()
-    result: dict[str, str] = {}
-    for name in sorted(subjects):
-        idx = int(hashlib.md5(name.encode("utf-8")).hexdigest(), 16) % n
-        probe = idx
-        while probe in taken:
-            probe = (probe + 1) % n
-        taken.add(probe)
-        result[name] = palette[probe]
-    return result
+    order = sorted(all_subjects, key=lambda s: (-len(adjacency[s]), s))
+    assigned: dict[str, str] = {}
+    for subj in order:
+        blocked = {assigned[n] for n in adjacency[subj] if n in assigned}
+        free = [c for c in SUBJECT_COLOR_IDS if c not in blocked]
+        if free:
+            assigned[subj] = free[0]
+        else:
+            # dzien zatloczony ponad 8 roznych przedmiotow — nie da sie uniknac
+            # kolizji, bierz przynajmniej najrzadziej uzywany kolor dotychczas
+            usage = Counter(assigned.values())
+            assigned[subj] = min(SUBJECT_COLOR_IDS, key=lambda c: usage.get(c, 0))
+    return assigned
 
 
 class CalendarAuthError(RuntimeError):
@@ -153,32 +161,6 @@ class GCal:
                 break
         return out
 
-    def ensure_labels(self, calendar_id: str, names_colors: dict[str, str]) -> dict[str, str]:
-        """Zapewnia, ze kazda nazwa w names_colors ma etykiete na kalendarzu z podanym
-        kolorem, zachowujac istniejace id (zeby juz przypisane eventLabelId nie osierocialy
-        sie przy kazdej synchronizacji). Zwraca mape nazwa -> label_id."""
-        try:
-            with open(LABELS_FILE, encoding="utf-8") as f:
-                known_ids: dict[str, str] = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            known_ids = {}
-
-        event_labels = []
-        for name, color in names_colors.items():
-            entry = {"name": name, "backgroundColor": color}
-            if name in known_ids:
-                entry["id"] = known_ids[name]
-            event_labels.append(entry)
-
-        result = self._req("PATCH", f"/calendars/{calendar_id}", json={
-            "labelProperties": {"eventLabels": event_labels}
-        })
-
-        new_ids = {lbl["name"]: lbl["id"] for lbl in result.get("labelProperties", {}).get("eventLabels", [])}
-        with open(LABELS_FILE, "w", encoding="utf-8") as f:
-            json.dump(new_ids, f, indent=2, ensure_ascii=False)
-        return new_ids
-
     def insert_event(self, calendar_id: str, body: dict):
         self._req("POST", f"/calendars/{calendar_id}/events", json=body)
 
@@ -210,17 +192,7 @@ def _lesson_subject(l: dict) -> str:
     return (l.get("Subject") or {}).get("Name", "?")
 
 
-def _lesson_label_name(l: dict) -> str:
-    ch = l.get("Change") or None
-    ctype = ch.get("Type") if ch else 0
-    if ctype == 1:
-        return LABEL_CANCELLED
-    if ctype == 2:
-        return LABEL_SUBST
-    return _lesson_subject(l)
-
-
-def _event_body(l: dict, label_map: dict[str, str]) -> dict | None:
+def _event_body(l: dict, subject_colors: dict[str, str]) -> dict | None:
     lid = l.get("Id")
     d = l.get("DateAt", "")
     ts = l.get("TimeSlot") or {}
@@ -233,18 +205,16 @@ def _event_body(l: dict, label_map: dict[str, str]) -> dict | None:
     ch = l.get("Change") or None
     ctype = ch.get("Type") if ch else 0
     prefix = "❌ " if ctype == 1 else "⚠ " if ctype == 2 else ""
-    label_id = label_map.get(_lesson_label_name(l))
-    body = {
+    color = COLOR_CANCELLED if ctype == 1 else COLOR_SUBST if ctype == 2 else subject_colors.get(subject, "1")
+    return {
         "summary": prefix + subject,
         "location": room or "",
         "description": teacher or "",
         "start": {"dateTime": f"{d}T{t_start}:00", "timeZone": "Europe/Warsaw"},
         "end": {"dateTime": f"{d}T{t_end}:00", "timeZone": "Europe/Warsaw"},
+        "colorId": color,
         "extendedProperties": {"private": {"vulcanscope_id": str(lid), "vulcanscope_source": SOURCE_TAG}},
     }
-    if label_id:
-        body["eventLabelId"] = label_id
-    return body
 
 
 def sync() -> dict:
@@ -257,17 +227,12 @@ def sync() -> dict:
     vc = VulcanClient()
     lessons = _fetch_all_lessons(vc)
     visible = [l for l in lessons if l.get("Visible") is not False]
-
-    subjects = {_lesson_subject(l) for l in visible if l.get("Id") is not None}
-    names_colors = _assign_colors(subjects)
-    names_colors[LABEL_CANCELLED] = COLOR_CANCELLED
-    names_colors[LABEL_SUBST] = COLOR_SUBST
-    label_map = gcal.ensure_labels(calendar_id, names_colors)
+    subject_colors = _assign_colors_graph(visible)
 
     seen_ids = set()
     created = updated = unchanged = 0
     for l in visible:
-        body = _event_body(l, label_map)
+        body = _event_body(l, subject_colors)
         if body is None:
             continue
         lid = body["extendedProperties"]["private"]["vulcanscope_id"]
@@ -284,7 +249,7 @@ def sync() -> dict:
 
             changed = (
                 prev.get("summary") != body["summary"]
-                or prev.get("eventLabelId") != body.get("eventLabelId")
+                or prev.get("colorId") != body["colorId"]
                 or prev.get("location", "") != body["location"]
                 or not _same_time(prev.get("start", {}).get("dateTime", ""), body["start"]["dateTime"])
                 or not _same_time(prev.get("end", {}).get("dateTime", ""), body["end"]["dateTime"])
