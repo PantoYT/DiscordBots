@@ -170,14 +170,18 @@ def exam_embed(exam: dict) -> discord.Embed:
         description=exam.get("Content") or "Brak opisu",
         color=subject_color(subject),
     )
-    deadline = exam.get("Deadline", {})
-    embed.add_field(name="Data",       value=fmt_date(deadline.get("Date", "?")), inline=True)
+    embed.add_field(name="Data",       value=fmt_date(exam_date(exam) or "?"), inline=True)
     embed.add_field(name="Typ",        value=exam.get("Type") or "Sprawdzian",    inline=True)
     creator = exam.get("Creator", {})
     if creator:
         embed.add_field(name="Nauczyciel", value=creator.get("DisplayName", "?"), inline=True)
     embed.set_footer(text="Vred • eduVulcan bot")
     return embed
+
+
+def exam_date(exam: dict) -> str:
+    """API przeszła z zagnieżdżonego Deadline.Date na płaskie DeadlineAt — obsłuż oba."""
+    return exam.get("DeadlineAt") or (exam.get("Deadline") or {}).get("Date") or ""
 
 
 def lesson_date(lesson: dict) -> str | None:
@@ -442,7 +446,7 @@ async def slash_sprawdziany(interaction: discord.Interaction, tygodnie: int = 2)
         now    = datetime.now(CET)
         client = get_client()
         exams  = client.get_exams(now, now + timedelta(weeks=tygodnie))
-        exams  = sorted(exams, key=lambda e: e.get("Deadline", {}).get("Date", "9999"))
+        exams  = sorted(exams, key=lambda e: exam_date(e) or "9999")
         if not exams:
             await interaction.followup.send("✅ Brak sprawdzianów w tym okresie.")
             return
@@ -460,12 +464,12 @@ async def slash_nastepny(interaction: discord.Interaction):
         now    = datetime.now(CET)
         client = get_client()
         exams  = client.get_exams(now, now + timedelta(weeks=8))
-        exams  = sorted(exams, key=lambda e: e.get("Deadline", {}).get("Date", "9999"))
+        exams  = sorted(exams, key=lambda e: exam_date(e) or "9999")
         if not exams:
             await interaction.followup.send("✅ Brak nadchodzących sprawdzianów.")
             return
         exam     = exams[0]
-        deadline = exam.get("Deadline", {}).get("Date", "")
+        deadline = exam_date(exam)
         subject  = exam.get("Subject", {}).get("Name", "?")
         try:
             d    = datetime.strptime(deadline, "%Y-%m-%d").replace(tzinfo=CET)
@@ -601,11 +605,11 @@ async def rotate_status():
 
         # Slot 4: następny sprawdzian
         exams = client.get_exams(now, now + timedelta(weeks=8))
-        exams = sorted(exams, key=lambda e: e.get("Deadline", {}).get("Date", "9999"))
+        exams = sorted(exams, key=lambda e: exam_date(e) or "9999")
         if exams:
             e    = exams[0]
             subj = e.get("Subject", {}).get("Name", "?")
-            date = e.get("Deadline", {}).get("Date", "")
+            date = exam_date(e)
             try:
                 d    = datetime.strptime(date, "%Y-%m-%d")
                 diff = (d - now.replace(tzinfo=None)).days
