@@ -28,6 +28,7 @@ tworzy duplikatów przy kolejnych synchronizacjach, aktualizuje zmienione
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from datetime import date, timedelta
@@ -38,7 +39,8 @@ import requests
 from client import VulcanClient
 
 ROOT = Path(__file__).resolve().parent
-TOKEN_FILE = ROOT / "google_calendar_token.json"
+DATA_DIR = Path(os.getenv("VRED_DATA_DIR") or ROOT)
+TOKEN_FILE = DATA_DIR / "google_calendar_token.json"
 CALENDAR_SUMMARY = "Lekcje"  # celowo inna nazwa niz "Plan lekcji" (ta jest zajeta przez subskrypcje .ics — tamta jest tylko-do-odczytu)
 CHUNK_DAYS = 28
 SOURCE_TAG = "vred"
@@ -224,7 +226,7 @@ def sync() -> dict:
     calendar_id = gcal.find_or_create_calendar(CALENDAR_SUMMARY)
     existing = gcal.list_synced_events(calendar_id)
 
-    vc = VulcanClient()
+    vc = VulcanClient(str(DATA_DIR / "credentials.json"))
     lessons = _fetch_all_lessons(vc)
     visible = [l for l in lessons if l.get("Visible") is not False]
     subject_colors = _assign_colors_graph(visible)

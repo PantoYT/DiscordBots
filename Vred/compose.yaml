@@ -1,0 +1,19 @@
+services:
+  vred:
+    build: .
+    image: vred:local
+    container_name: vred
+    restart: unless-stopped
+    # Owner of ./data on the host, so state files stay editable without root.
+    user: "1000:1000"
+    volumes:
+      # .env, credentials.json, google_calendar_token.json and seen_*.json
+      - ./data:/data
+    labels:
+      # Locally built image — nothing for Watchtower to pull.
+      com.centurylinklabs.watchtower.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

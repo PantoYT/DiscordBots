@@ -1,0 +1,2 @@
+# Only for register.py (one-time eduVULCAN login), not needed by the bot
+playwright

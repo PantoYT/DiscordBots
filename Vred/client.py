@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from email.utils import formatdate
 from urllib.parse import quote
 import requests
+import pytz
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -22,6 +23,9 @@ VAPI         = "1"
 DEVICE_MODEL = "Xiaomi MI 9"
 APP_VERSION  = "25.02.14 (G)"
 BASE_URL     = "https://lekcjaplus.vulcan.net.pl"
+WARSAW       = pytz.timezone("Europe/Warsaw")
+TIMEOUT      = 30   # Hebe regularly takes >15 s at night
+RETRIES      = 2
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +116,15 @@ class VulcanClient:
         self._session     = requests.Session()
 
     def _get(self, url: str) -> dict:
-        headers = _build_headers(self._fingerprint, self._private_key, None, url)
-        r = self._session.get(url, headers=headers, timeout=15)
+        for attempt in range(RETRIES + 1):
+            # Headers are signed with vDate, so they are rebuilt per attempt.
+            headers = _build_headers(self._fingerprint, self._private_key, None, url)
+            try:
+                r = self._session.get(url, headers=headers, timeout=TIMEOUT)
+                break
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt == RETRIES:
+                    raise
         r.raise_for_status()
         data = r.json()
         if data.get("Status", {}).get("Code", 0) != 0:
@@ -143,12 +154,24 @@ class VulcanClient:
         return self._get(url)["Envelope"]
 
     def get_lessons(self, date_from: datetime, date_to: datetime) -> list:
-        df = date_from.strftime("%Y-%m-%d")
-        dt = date_to.strftime("%Y-%m-%d")
+        """Lessons with Substitution details (replacement subject/teacher, reason)."""
+        return self.get_schedule_changes(
+            date_from.strftime("%Y-%m-%d"), date_to.strftime("%Y-%m-%d"), self._period_id())
+
+    def get_grades(self, period_id: int | None = None) -> list:
         url = (
-            f"{self._rest_url}/{self._symbol()}/api/mobile/schedule/byPupil"
+            f"{self._rest_url}/{self._symbol()}/api/mobile/grade/byPupil"
             f"?unitId={self._unit_id()}&pupilId={self._pupil_id()}"
-            f"&periodId={self._period_id()}&dateFrom={df}&dateTo={dt}&pageSize=100"
+            f"&periodId={period_id or self._period_id()}&pageSize=500"
+        )
+        return self._get(url)["Envelope"]
+
+    def get_grades_summary(self, period_id: int | None = None) -> list:
+        """Per subject: Entry_1 = proposed, Entry_2 = final grade."""
+        url = (
+            f"{self._rest_url}/{self._symbol()}/api/mobile/grade/summary/byPupil"
+            f"?unitId={self._unit_id()}&pupilId={self._pupil_id()}"
+            f"&periodId={period_id or self._period_id()}&pageSize=500"
         )
         return self._get(url)["Envelope"]
 
@@ -163,7 +186,7 @@ class VulcanClient:
         return self._get(url)["Envelope"]
 
     def get_lucky_number(self) -> int | None:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(WARSAW).strftime("%Y-%m-%d")
         constituent_id = self._pupil.get("ConstituentUnit", {}).get("Id", 0)
         url = (
             f"{self._rest_url}/{self._symbol()}/api/mobile/school/lucky"

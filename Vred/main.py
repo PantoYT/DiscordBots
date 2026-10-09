@@ -8,10 +8,16 @@ from dotenv import load_dotenv
 import pytz
 import requests as req
 
+from pathlib import Path
+
 from client import VulcanClient
 import calendar_sync
+import logic
 
-load_dotenv()
+# Stan i sekrety (credentials.json, token Google, seen_*.json) leza w DATA_DIR —
+# domyslnie obok skryptu, w kontenerze na wolumenie (VRED_DATA_DIR=/data).
+DATA_DIR = Path(os.getenv("VRED_DATA_DIR") or Path(__file__).resolve().parent)
+load_dotenv(DATA_DIR / ".env")
 
 TOKEN            = os.getenv("DISCORD_TOKEN")
 OWNER_ID         = int(os.getenv("OWNER_ID"))
@@ -20,9 +26,13 @@ EXAMS_CHANNEL    = os.getenv("EXAMS_CHANNEL", "sprawdziany")
 CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", 60))
 
 CET               = pytz.timezone("Europe/Warsaw")
-SEEN_EXAMS_FILE   = "seen_exams.json"
-SCHEDULE_MSG_FILE = "schedule_message.json"
+SEEN_EXAMS_FILE   = DATA_DIR / "seen_exams.json"
+SCHEDULE_MSG_FILE = DATA_DIR / "schedule_message.json"
+SEEN_GRADES_FILE  = DATA_DIR / "seen_grades.json"
+REMINDER_FILE     = DATA_DIR / "reminder_state.json"
+CREDENTIALS_FILE  = DATA_DIR / "credentials.json"
 DAILY_HOUR        = int(os.getenv("DAILY_HOUR", 7))
+REMINDER_HOUR     = int(os.getenv("REMINDER_HOUR", 19))
 CALENDAR_SYNC_HOUR = int(os.getenv("CALENDAR_SYNC_HOUR", 20))
 UPTIME_KUMA_URL   = os.getenv("UPTIME_KUMA_URL", "")
 last_schedule_run: str | None = None
@@ -45,13 +55,28 @@ def load_seen() -> set:
         return set()
 
 
+def save_json(path: Path, data):
+    """Zapis atomowy — padniecie w polowie nie zostawi pustego pliku stanu."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def load_json(path: Path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
 def save_seen(seen: set):
-    with open(SEEN_EXAMS_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(seen), f)
+    save_json(SEEN_EXAMS_FILE, list(seen))
 
 
 def get_client() -> VulcanClient:
-    return VulcanClient()
+    return VulcanClient(str(CREDENTIALS_FILE))
 
 
 def load_schedule_msg() -> dict:
@@ -63,8 +88,7 @@ def load_schedule_msg() -> dict:
 
 
 def save_schedule_msg(data: dict):
-    with open(SCHEDULE_MSG_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    save_json(SCHEDULE_MSG_FILE, data)
 
 
 def build_schedule_table(lessons: list, date_str: str) -> discord.Embed:
@@ -76,20 +100,16 @@ def build_schedule_table(lessons: list, date_str: str) -> discord.Embed:
         embed.set_footer(text="Vred • eduVulcan bot")
         return embed
 
-    sorted_lessons = sorted(lessons, key=lambda l: l.get("TimeSlot", {}).get("Position", 99))
+    views = sorted((logic.lesson_view(l) for l in lessons), key=lambda v: v["pos"])
 
     # Build monospace table
     rows = []
-    for l in sorted_lessons:
-        slot    = l.get("TimeSlot", {})
-        pos     = str(slot.get("Position", "?"))
-        time    = slot.get("Display", "?????-?????")
-        subject = l.get("Subject", {}).get("Name", "?")[:24]
-        room    = l.get("Room")
-        room_s  = room["Code"] if room else "  -  "
-        change  = l.get("Change")
-        flag    = " !" if change else "  "
-        rows.append((pos, time, subject, room_s, flag))
+    changes = []
+    for v in views:
+        flag = {"cancelled": " x", "subst": " !"}.get(v["kind"], "  ")
+        rows.append((str(v["pos"]), v["time"], v["subject"][:24], v["room"] or "  -  ", flag))
+        if v["kind"] != "normal":
+            changes.append(f"`{v['pos']}.` **{v['subject']}** {logic.change_text(v)}")
 
     # Column widths
     w_pos  = max(len(r[0]) for r in rows)
@@ -104,8 +124,9 @@ def build_schedule_table(lessons: list, date_str: str) -> discord.Embed:
         lines.append(f"{pos:<{w_pos}}  {time:<{w_time}}  {subj:<{w_subj}}  {room:<{w_room}}{flag}")
 
     embed.description = f"```\n{chr(10).join(lines)}\n```"
-    if any(r[4].strip() for r in rows):
-        embed.set_footer(text="! = zastępstwo  •  Vred • eduVulcan bot")
+    if changes:
+        embed.add_field(name="Zmiany", value="\n".join(changes)[:1024], inline=False)
+        embed.set_footer(text="! = zastępstwo  •  x = odwołane  •  Vred • eduVulcan bot")
     else:
         embed.set_footer(text="Vred • eduVulcan bot")
     return embed
@@ -163,7 +184,12 @@ def fmt_date(date_str: str) -> str:
         return date_str
 
 
-def exam_embed(exam: dict) -> discord.Embed:
+def exam_label(exam: dict) -> str:
+    return f"{exam.get('Subject', {}).get('Name', '?')} ({(exam.get('Type') or 'sprawdzian').lower()})"
+
+
+def exam_embed(exam: dict, all_exams: list | None = None) -> discord.Embed:
+    """all_exams — jesli podane, dokleja ostrzezenie o innych sprawdzianach tego dnia."""
     subject = exam.get("Subject", {}).get("Name", "?")
     embed = discord.Embed(
         title=f"📝 {subject}",
@@ -175,6 +201,12 @@ def exam_embed(exam: dict) -> discord.Embed:
     creator = exam.get("Creator", {})
     if creator:
         embed.add_field(name="Nauczyciel", value=creator.get("DisplayName", "?"), inline=True)
+    if all_exams:
+        others = [e for e in all_exams
+                  if exam_date(e) == exam_date(exam) and e.get("Id") != exam.get("Id")]
+        if others:
+            embed.add_field(name=f"⚠️ Tego dnia też ({len(others)})",
+                            value="\n".join(exam_label(e) for e in others), inline=False)
     embed.set_footer(text="Vred • eduVulcan bot")
     return embed
 
@@ -190,15 +222,15 @@ def lesson_date(lesson: dict) -> str | None:
 
 
 def lesson_line(lesson: dict) -> str:
-    slot     = lesson.get("TimeSlot", {})
-    pos      = slot.get("Position", "?")
-    time     = slot.get("Display", "?")
-    name     = lesson.get("Subject", {}).get("Name", "?")
-    room     = lesson.get("Room")
-    room_str = f" • sala {room['Code']}" if room else ""
-    change   = lesson.get("Change")
-    sub_str  = " ⚠️ zastępstwo" if change else ""
-    return f"`{pos}.` **{time}** {name}{room_str}{sub_str}"
+    v        = logic.lesson_view(lesson)
+    room_str = f" • sala {v['room']}" if v["room"] else ""
+    name     = f"~~{v['subject']}~~" if v["kind"] == "cancelled" else v["subject"]
+    change   = logic.change_text(v)
+    return f"`{v['pos']}.` **{v['time']}** {name}{room_str}{' ' + change if change else ''}"
+
+
+def lesson_sort_key(lesson: dict) -> int:
+    return logic.lesson_view(lesson)["pos"]
 
 
 def schedule_embed(lessons: list, date_str: str) -> discord.Embed:
@@ -209,7 +241,7 @@ def schedule_embed(lessons: list, date_str: str) -> discord.Embed:
     if not lessons:
         embed.description = "Brak lekcji tego dnia."
         return embed
-    sorted_lessons = sorted(lessons, key=lambda l: l.get("TimeSlot", {}).get("Position", 99))
+    sorted_lessons = sorted(lessons, key=lesson_sort_key)
     embed.description = "\n".join(lesson_line(l) for l in sorted_lessons)
     embed.set_footer(text="Vred • eduVulcan bot")
     return embed
@@ -234,7 +266,7 @@ def week_embed(lessons: list, monday: datetime, ktory: str) -> discord.Embed:
     for offset in range(7):
         day = monday + timedelta(days=offset)
         date_str = day.strftime("%Y-%m-%d")
-        day_lessons = sorted(by_date.get(date_str, []), key=lambda l: l.get("TimeSlot", {}).get("Position", 99))
+        day_lessons = sorted(by_date.get(date_str, []), key=lesson_sort_key)
         name = f"{WEEKDAYS_PL[offset]} {day.strftime('%d.%m')}"
         value = "\n".join(lesson_line(l) for l in day_lessons) if day_lessons else "Brak lekcji."
         embed.add_field(name=name, value=value[:1024], inline=False)
@@ -263,7 +295,7 @@ async def daily_schedule():
         return
     try:
         client   = get_client()
-        lessons  = client.get_lessons(now, now)
+        lessons  = await asyncio.to_thread(client.get_lessons, now, now)
         date_str = today
         day      = [l for l in lessons if lesson_date(l) == date_str]
         embed    = build_schedule_table(day, date_str)
@@ -295,8 +327,11 @@ async def run_calendar_sync(reason: str):
         try:
             owner = await bot.fetch_user(OWNER_ID)
             await owner.send(
-                "📅 Synchronizacja kalendarza Google wygasła (tryb Testing, ~7 dni).\n"
-                "Odpal na PC: `py -3.12 calendar_auth.py` w folderze Vred, żeby odnowić."
+                "📅 Synchronizacja kalendarza Google wygasła.\n"
+                "Na PC w folderze Vred: `py -3.12 calendar_auth.py`, potem\n"
+                "`scp google_calendar_token.json ubuntu@100.117.148.97:~/vred/data/` "
+                "i `docker restart vred` na serwerze.\n"
+                "Żeby nie wracało co 7 dni: aplikacja OAuth w Google Cloud → *In production*."
             )
         except Exception as dm_err:
             print(f"[calendar_sync:{reason}] nie udalo sie wyslac DM: {dm_err}")
@@ -333,16 +368,149 @@ async def check_exams():
     try:
         now    = datetime.now(CET)
         client = get_client()
-        exams  = client.get_exams(now, now + timedelta(weeks=4))
+        exams  = await asyncio.to_thread(client.get_exams, now, now + timedelta(weeks=4))
         seen   = load_seen()
         for exam in exams:
             eid = str(exam["Id"])
             if eid not in seen:
-                await channel.send(embed=exam_embed(exam))
+                await channel.send(embed=exam_embed(exam, exams))
                 seen.add(eid)
         save_seen(seen)
     except Exception as e:
         print(f"[check_exams] Błąd: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Wieczorne przypomnienie — co jutro (sprawdziany + zmiany w planie)
+# ---------------------------------------------------------------------------
+
+async def build_reminder(now: datetime) -> discord.Embed | None:
+    client   = get_client()
+    tomorrow = now + timedelta(days=1)
+    t_str    = tomorrow.strftime("%Y-%m-%d")
+    exams    = await asyncio.to_thread(client.get_exams, tomorrow, tomorrow + timedelta(days=7))
+    lessons  = await asyncio.to_thread(client.get_lessons, tomorrow, tomorrow)
+
+    embed = discord.Embed(title=f"🔔 Jutro — {fmt_date(t_str)}", color=VRED_COLOR)
+    t_exams = [e for e in exams if exam_date(e) == t_str]
+    if t_exams:
+        warn = " ⚠️" if len(t_exams) >= 2 else ""
+        embed.add_field(
+            name=f"📝 Sprawdziany ({len(t_exams)}){warn}",
+            value="\n".join(f"**{exam_label(e)}** — {e.get('Content') or 'brak opisu'}"
+                            for e in t_exams)[:1024],
+            inline=False,
+        )
+    changes = []
+    for v in sorted((logic.lesson_view(l) for l in lessons if lesson_date(l) == t_str),
+                    key=lambda v: v["pos"]):
+        if v["kind"] != "normal":
+            changes.append(f"`{v['pos']}.` **{v['subject']}** {logic.change_text(v)}")
+    if changes:
+        embed.add_field(name="🔀 Zmiany w planie", value="\n".join(changes)[:1024], inline=False)
+
+    # W niedziele: podglad calego tygodnia i dni z kilkoma sprawdzianami naraz
+    if now.weekday() == 6:
+        week = logic.exams_by_day(exams)
+        if week:
+            lines = []
+            for d, es in week.items():
+                mark = " ⚠️" if len(es) >= 2 else ""
+                lines.append(f"**{fmt_date(d)}**{mark}: " + ", ".join(exam_label(e) for e in es))
+            embed.add_field(name="🗓️ Ten tydzień", value="\n".join(lines)[:1024], inline=False)
+
+    if not embed.fields:
+        return None
+    embed.set_footer(text="Vred • eduVulcan bot")
+    return embed
+
+
+@tasks.loop(minutes=1)
+async def evening_reminder():
+    now   = datetime.now(CET)
+    today = now.strftime("%Y-%m-%d")
+    if now.hour < REMINDER_HOUR:
+        return
+    state = load_json(REMINDER_FILE, {})
+    if state.get("last") == today:
+        return
+    channel = discord.utils.get(bot.get_all_channels(), name=EXAMS_CHANNEL)
+    if not channel:
+        return
+    try:
+        embed = await build_reminder(now)
+        if embed:
+            await channel.send(embed=embed)
+        # Zapis dopiero po sukcesie — przy bledzie Vulcana sprobuje za minute.
+        save_json(REMINDER_FILE, {"last": today})
+    except Exception as e:
+        print(f"[evening_reminder] {e}")
+
+
+@evening_reminder.before_loop
+async def before_reminder():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
+# Nowe oceny — DM do wlasciciela (oceny sa prywatne, nie na kanal)
+# ---------------------------------------------------------------------------
+
+def fmt_avg(avg: float | None) -> str:
+    return f"{avg:.2f}" if avg is not None else "—"
+
+
+def grade_embed(g: dict, grades: list, fresh_ids: set, modified: bool) -> discord.Embed:
+    col     = g.get("Column") or {}
+    subject = logic.grade_subject(g)
+    same    = [x for x in grades if logic.grade_subject(x) == subject]
+    before  = logic.weighted_avg([x for x in same if str(x.get("Id")) not in fresh_ids])
+    after   = logic.weighted_avg(same)
+    title   = "✏️ Zmieniona ocena" if modified else "🎓 Nowa ocena"
+    embed = discord.Embed(
+        title=f"{title}: {g.get('Content') or '?'} — {subject}",
+        description=col.get("Name") or None,
+        color=subject_color(subject),
+    )
+    embed.add_field(name="Waga", value=f"{col.get('Weight', 0):g}", inline=True)
+    embed.add_field(name="Kategoria", value=(col.get("Category") or {}).get("Name") or "—", inline=True)
+    if not modified:
+        trend = "" if before is None or after is None else (" 📈" if after > before else " 📉" if after < before else "")
+        embed.add_field(name="Średnia", value=f"{fmt_avg(before)} → **{fmt_avg(after)}**{trend}", inline=True)
+    else:
+        embed.add_field(name="Średnia", value=f"**{fmt_avg(after)}**", inline=True)
+    if g.get("Comment"):
+        embed.add_field(name="Komentarz", value=g["Comment"][:1024], inline=False)
+    embed.set_footer(text=f"{(g.get('Creator') or {}).get('DisplayName', '')} • Vred")
+    return embed
+
+
+@tasks.loop(minutes=CHECK_INTERVAL)
+async def check_grades():
+    try:
+        client = get_client()
+        grades = await asyncio.to_thread(client.get_grades)
+        first_run = not SEEN_GRADES_FILE.exists()
+        seen = load_json(SEEN_GRADES_FILE, {})
+        new, modified = logic.grade_changes(grades, seen)
+        if (new or modified) and not first_run:
+            owner = await bot.fetch_user(OWNER_ID)
+            fresh_ids = {str(g.get("Id")) for g in new}
+            batch = [(g, False) for g in new] + [(g, True) for g in modified]
+            for g, is_mod in batch[:10]:
+                await owner.send(embed=grade_embed(g, grades, fresh_ids, is_mod))
+            if len(batch) > 10:
+                await owner.send(f"…i jeszcze {len(batch) - 10} zmian w ocenach — `/srednie`.")
+        # Pierwszy przebieg tylko zapamietuje stan, zeby nie zasypac DM-a historia.
+        seen.update({str(g.get("Id")): g.get("Content") or "" for g in grades})
+        save_json(SEEN_GRADES_FILE, seen)
+    except Exception as e:
+        print(f"[check_grades] {e}")
+
+
+@check_grades.before_loop
+async def before_grades():
+    await bot.wait_until_ready()
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +530,7 @@ async def slash_commands(interaction: discord.Interaction):
     embed.add_field(name="/tydzien",     value="Plan lekcji na cały tydzień (poprzedni/obecny/następny)", inline=False)
     embed.add_field(name="/sprawdziany", value="Nadchodzące sprawdziany",          inline=False)
     embed.add_field(name="/nastepny",    value="Czas do następnego sprawdzianu",   inline=False)
+    embed.add_field(name="/srednie",     value="Średnie ważone i oceny (owner only, prywatnie)", inline=False)
     embed.add_field(name="/setup",       value="Utwórz kanały plan-lekcji i sprawdziany", inline=False)
     embed.add_field(name="/info",        value="Status bota (owner only)",         inline=False)
     embed.add_field(name="/sync",        value="Force sync komend (owner only)",   inline=False)
@@ -377,7 +546,7 @@ async def slash_plan(interaction: discord.Interaction):
         target   = datetime.now(CET)
         date_str = target.strftime("%Y-%m-%d")
         client   = get_client()
-        lessons  = client.get_lessons(target, target)
+        lessons  = await asyncio.to_thread(client.get_lessons, target, target)
         day      = [l for l in lessons if lesson_date(l) == date_str]
         embed    = build_schedule_table(day, date_str)
         # Aktualizuj wiadomość na kanale plan-lekcji jeśli komenda tam wywołana
@@ -397,7 +566,7 @@ async def slash_jutro(interaction: discord.Interaction):
         target   = datetime.now(CET) + timedelta(days=1)
         date_str = target.strftime("%Y-%m-%d")
         client   = get_client()
-        lessons  = client.get_lessons(target, target)
+        lessons  = await asyncio.to_thread(client.get_lessons, target, target)
         day      = [l for l in lessons if lesson_date(l) == date_str]
         await interaction.followup.send(embed=schedule_embed(day, date_str))
     except Exception as e:
@@ -411,7 +580,7 @@ async def slash_dzien(interaction: discord.Interaction, offset: int):
         target   = datetime.now(CET) + timedelta(days=offset)
         date_str = target.strftime("%Y-%m-%d")
         client   = get_client()
-        lessons  = client.get_lessons(target, target)
+        lessons  = await asyncio.to_thread(client.get_lessons, target, target)
         day      = [l for l in lessons if lesson_date(l) == date_str]
         await interaction.followup.send(embed=schedule_embed(day, date_str))
     except Exception as e:
@@ -433,7 +602,7 @@ async def slash_tydzien(interaction: discord.Interaction, ktory: str = "obecny")
         monday = today - timedelta(days=today.weekday()) + timedelta(weeks=week_offset)
         sunday = monday + timedelta(days=6)
         client  = get_client()
-        lessons = client.get_lessons(monday, sunday)
+        lessons = await asyncio.to_thread(client.get_lessons, monday, sunday)
         await interaction.followup.send(embed=week_embed(lessons, monday, ktory))
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
@@ -445,14 +614,20 @@ async def slash_sprawdziany(interaction: discord.Interaction, tygodnie: int = 2)
     try:
         now    = datetime.now(CET)
         client = get_client()
-        exams  = client.get_exams(now, now + timedelta(weeks=tygodnie))
+        exams  = await asyncio.to_thread(client.get_exams, now, now + timedelta(weeks=tygodnie))
         exams  = sorted(exams, key=lambda e: exam_date(e) or "9999")
         if not exams:
             await interaction.followup.send("✅ Brak sprawdzianów w tym okresie.")
             return
-        await interaction.followup.send(f"**📝 Sprawdziany — najbliższe {tygodnie} tygodnie:**")
+        header = f"**📝 Sprawdziany — najbliższe {tygodnie} tygodnie:**"
+        busy = logic.busy_days(exams)
+        if busy:
+            header += "".join(f"\n⚠️ **{fmt_date(d)}** — {len(es)} naraz: "
+                              + ", ".join(exam_label(e) for e in es)
+                              for d, es in busy.items())
+        await interaction.followup.send(header)
         for exam in exams:
-            await interaction.followup.send(embed=exam_embed(exam))
+            await interaction.followup.send(embed=exam_embed(exam, exams))
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
 
@@ -463,7 +638,7 @@ async def slash_nastepny(interaction: discord.Interaction):
     try:
         now    = datetime.now(CET)
         client = get_client()
-        exams  = client.get_exams(now, now + timedelta(weeks=8))
+        exams  = await asyncio.to_thread(client.get_exams, now, now + timedelta(weeks=8))
         exams  = sorted(exams, key=lambda e: exam_date(e) or "9999")
         if not exams:
             await interaction.followup.send("✅ Brak nadchodzących sprawdzianów.")
@@ -472,10 +647,8 @@ async def slash_nastepny(interaction: discord.Interaction):
         deadline = exam_date(exam)
         subject  = exam.get("Subject", {}).get("Name", "?")
         try:
-            d    = datetime.strptime(deadline, "%Y-%m-%d").replace(tzinfo=CET)
-            diff = d - now
-            days = diff.days
-            time_str = f"za **{days} dni**" if days > 0 else "**dziś**"
+            days = days_until(deadline, now)
+            time_str = {0: "**dziś**", 1: "**jutro**"}.get(days, f"za **{days} dni**")
         except Exception:
             time_str = ""
         embed = discord.Embed(
@@ -487,6 +660,47 @@ async def slash_nastepny(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
+
+
+@bot.tree.command(name="srednie", description="Średnie ważone z bieżącego okresu (tylko właściciel, widzisz tylko ty)")
+async def slash_srednie(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Tylko właściciel może zobaczyć oceny.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        client  = get_client()
+        grades  = await asyncio.to_thread(client.get_grades)
+        summary = await asyncio.to_thread(client.get_grades_summary)
+        if not grades:
+            await interaction.followup.send("Brak ocen w tym okresie.", ephemeral=True)
+            return
+        by_subj: dict[str, list] = {}
+        position: dict[str, int] = {}
+        for g in grades:
+            s = logic.grade_subject(g)
+            by_subj.setdefault(s, []).append(g)
+            position[s] = ((g.get("Column") or {}).get("Subject") or {}).get("Position", 999)
+        entries = {(x.get("Subject") or {}).get("Name"): x for x in summary}
+
+        lines = []
+        for s in sorted(by_subj, key=lambda s: (position[s], s)):
+            gs      = sorted(by_subj[s], key=lambda g: g.get("CreatedAt") or "")
+            marks   = " ".join(g.get("Content") or "?" for g in gs)
+            e       = entries.get(s) or {}
+            extra   = "".join(f" • {label} **{e[k]}**" for k, label in
+                              (("Entry_1", "prop."), ("Entry_2", "końc.")) if e.get(k))
+            lines.append(f"**{fmt_avg(logic.weighted_avg(gs))}** {s} — `{marks}`{extra}")
+
+        embed = discord.Embed(
+            title=f"📊 Średnie — ogólna {fmt_avg(logic.weighted_avg(grades))}",
+            description="\n".join(lines)[:4096],
+            color=VRED_COLOR,
+        )
+        embed.set_footer(text=f"+ = +{logic.PLUS_MOD}, − = {logic.MINUS_MOD} • {len(grades)} ocen • Vred")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
 
 
 @bot.tree.command(name="info", description="Status bota (owner only)")
@@ -578,6 +792,16 @@ async def slash_shutdown(interaction: discord.Interaction):
 # Rotating status
 # ---------------------------------------------------------------------------
 
+def days_until(date_str: str, now: datetime) -> int:
+    # Kalendarzowa roznica dni, nie (polnoc - teraz).days — tamto dawalo -1 dla dzisiaj.
+    return (datetime.strptime(date_str, "%Y-%m-%d").date() - now.date()).days
+
+
+def days_until_label(date_str: str, now: datetime) -> str:
+    days = days_until(date_str, now)
+    return {0: "dziś", 1: "jutro"}.get(days, f"za {days}d")
+
+
 status_index = 0
 
 @tasks.loop(minutes=5)
@@ -592,28 +816,26 @@ async def rotate_status():
         slots.append("Plan lekcji | /commands")
 
         # Slot 2: szczęśliwy numerek
-        lucky = client.get_lucky_number()
+        lucky = await asyncio.to_thread(client.get_lucky_number)
         if lucky:
             slots.append(f"🍀 Szczęśliwy numerek: {lucky}")
 
         # Slot 3: ile lekcji dziś
         date_str = now.strftime("%Y-%m-%d")
-        lessons  = client.get_lessons(now, now)
+        lessons  = await asyncio.to_thread(client.get_lessons, now, now)
         today    = [l for l in lessons if lesson_date(l) == date_str]
         if today:
             slots.append(f"📅 Dziś {len(today)} lekcji")
 
         # Slot 4: następny sprawdzian
-        exams = client.get_exams(now, now + timedelta(weeks=8))
+        exams = await asyncio.to_thread(client.get_exams, now, now + timedelta(weeks=8))
         exams = sorted(exams, key=lambda e: exam_date(e) or "9999")
         if exams:
             e    = exams[0]
             subj = e.get("Subject", {}).get("Name", "?")
             date = exam_date(e)
             try:
-                d    = datetime.strptime(date, "%Y-%m-%d")
-                diff = (d - now.replace(tzinfo=None)).days
-                slots.append(f"📝 {subj} za {diff}d")
+                slots.append(f"📝 {subj} {days_until_label(date, now)}")
             except Exception:
                 slots.append(f"📝 {subj}")
 
@@ -699,11 +921,12 @@ async def on_ready():
         name="Plan lekcji | /commands",
     ))
 
-    daily_schedule.start()
-    check_exams.start()
-    rotate_status.start()
-    uptime_ping.start()
-    calendar_sync_task.start()
+    # on_ready wraca po kazdym pelnym reconnectcie — drugi .start() rzucilby RuntimeError.
+    if daily_schedule.is_running():
+        return
+    for loop in (daily_schedule, check_exams, rotate_status, uptime_ping,
+                 calendar_sync_task, evening_reminder, check_grades):
+        loop.start()
     asyncio.create_task(run_calendar_sync("startup"))
 
 
