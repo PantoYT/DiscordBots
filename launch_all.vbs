@@ -23,4 +23,6 @@ End Sub
 ' LaunchVbs "E:\Pliki\Projects\DiscordBots\Rred\rred_launch.vbs"
 ' LaunchVbs "E:\Pliki\Projects\DiscordBots\Ared\ared_launch.vbs"
 ' LaunchVbs "E:\Pliki\Projects\DiscordBots\Mred\mred_launch.vbs"
+' otnaP: od 2026-10-18 to Hermes Agent na serwerze (~/otnap) na tym samym tokenie.
+' Stary otnap_launch.vbs NIE odpalac — dwie bramki na jednym tokenie sie bija.
 ' LaunchVbs "E:\Pliki\Projects\DiscordBots\otnaP\otnap_launch.vbs"
