@@ -43,7 +43,9 @@ EPIC_API_URL = (
 USER_AGENT = "Mozilla/5.0 (Fred free-games Discord bot)"
 
 BASE_DIR = pathlib.Path(__file__).parent
-POSTED_FILE = BASE_DIR / "posted_games.json"
+# State lives next to the code locally; in Docker FRED_DATA_DIR points at the volume.
+DATA_DIR = pathlib.Path(os.getenv("FRED_DATA_DIR") or BASE_DIR)
+POSTED_FILE = DATA_DIR / "posted_games.json"
 CHANNEL_NAME = "free-games"
 CET = pytz.timezone('Europe/Warsaw')
 

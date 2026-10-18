@@ -8,12 +8,13 @@ Sub LaunchVbs(path)
     End If
 End Sub
 
-' === Aktywne boty: tylko Fred, Qred ===
-' (Cred chodzi osobno na serwerze przez run.sh/keepalive.sh, nie z tego vbs.)
-' (Vred od 2026-09-28 chodzi na serwerze: ~/vred, docker compose. NIE odpalac go
-'  tutaj rownolegle — pisalby wszystko podwojnie.)
-LaunchVbs "E:\Pliki\Projects\DiscordBots\Fred\fred_launch.vbs"
-LaunchVbs "E:\Pliki\Projects\DiscordBots\Qred\qred_launch.vbs"
+' === Aktywne boty na PC: zadne ===
+' (Vred od 2026-09-28, Fred i Qred od 2026-10-18 chodza na serwerze:
+'  ~/vred, ~/fred, ~/qred, docker compose. NIE odpalac ich tutaj rownolegle —
+'  druga instancja na tym samym tokenie dubluje posty i rozjezdza stan
+'  (cytaty Qreda trafialy do dwoch roznych quotes.json).)
+' LaunchVbs "E:\Pliki\Projects\DiscordBots\Fred\fred_launch.vbs"
+' LaunchVbs "E:\Pliki\Projects\DiscordBots\Qred\qred_launch.vbs"
 ' LaunchVbs "E:\Pliki\Projects\DiscordBots\Vred\vred_launch.vbs"
 
 ' === Zaparkowane (odpięte od utrzymania 2026-07-24). Odkomentuj, by wrócić. ===

@@ -28,7 +28,8 @@ except OSError:
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
-QUOTE_FILE = pathlib.Path(__file__).parent / "quotes.json"
+# State lives next to the code locally; in Docker QRED_DATA_DIR points at the volume.
+QUOTE_FILE = pathlib.Path(os.getenv("QRED_DATA_DIR") or pathlib.Path(__file__).parent) / "quotes.json"
 
 # -------------------------------
 # Discord bot setup
