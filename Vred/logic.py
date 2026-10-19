@@ -176,6 +176,73 @@ def html_to_text(content: str) -> str:
     return s.strip()
 
 
+def new_by_id(items, seen: set[str]) -> list[dict]:
+    """Homework / notes not seen before (by Id)."""
+    return [x for x in items if str(x.get("Id")) not in seen]
+
+
+# --------------------------------------------------------------------------- #
+# Attendance — lesson/byPupil PresenceType carries boolean flags
+# --------------------------------------------------------------------------- #
+
+def presence_issue(l: dict) -> str | None:
+    """'nieobecność' / 'spóźnienie' style label when the entry needs attention."""
+    p = l.get("PresenceType") or {}
+    if p.get("Removed") or not (p.get("Absence") or p.get("Late")):
+        return None
+    return p.get("Name") or ("spóźnienie" if p.get("Late") else "nieobecność")
+
+
+def attendance_changes(lessons, seen: dict[str, int]) -> list[dict]:
+    """Lessons whose PresenceType became an absence/late since last check."""
+    out = []
+    for l in lessons:
+        pid = (l.get("PresenceType") or {}).get("Id")
+        if pid is None or seen.get(str(l.get("Id"))) == pid:
+            continue
+        if presence_issue(l):
+            out.append(l)
+    return out
+
+
+def attendance_stats(lessons) -> dict[str, tuple[int, int]]:
+    """{subject: (present, counted)}; '' key = all subjects together.
+    Counted = entries marked present or absent; 'lekcja się nie odbyła' etc. are neither."""
+    stats: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for l in lessons:
+        p = l.get("PresenceType") or {}
+        if p.get("Removed") or not l.get("CalculatePresence", True):
+            continue
+        if not (p.get("Presence") or p.get("Absence")):
+            continue
+        subj = (l.get("Subject") or {}).get("Name", "?")
+        for key in (subj, ""):
+            stats[key][1] += 1
+            if p.get("Presence"):
+                stats[key][0] += 1
+    return {k: (v[0], v[1]) for k, v in stats.items()}
+
+
+# --------------------------------------------------------------------------- #
+# Proposed / final grades — grade/summary: Entry_1 = proposed, Entry_2 = final
+# --------------------------------------------------------------------------- #
+
+def summary_changes(summary, seen: dict[str, list]) -> list[tuple[dict, str, str]]:
+    """[(entry, 'proponowana'|'końcowa', value)] for entries that appeared or changed."""
+    out = []
+    for s in summary:
+        old = seen.get(str(s.get("Id"))) or [None, None]
+        for i, (key, label) in enumerate((("Entry_1", "proponowana"), ("Entry_2", "końcowa"))):
+            val = s.get(key)
+            if val and val != old[i]:
+                out.append((s, label, val))
+    return out
+
+
+def summary_state(summary) -> dict[str, list]:
+    return {str(s.get("Id")): [s.get("Entry_1"), s.get("Entry_2")] for s in summary}
+
+
 def new_messages(messages, seen: set[str]) -> list[dict]:
     """Unseen, not withdrawn, oldest first."""
     fresh = [m for m in messages
@@ -253,6 +320,32 @@ def selftest() -> int:
     msgs = [{"Id": "b", "SentAt": "2026-10-19T12:00"}, {"Id": "a", "SentAt": "2026-10-01T08:00"},
             {"Id": "c", "SentAt": "2026-10-02T08:00", "Withdrawn": True}, {"Id": "d", "SentAt": "2026-09-01"}]
     check([m["Id"] for m in new_messages(msgs, {"d"})] == ["a", "b"], "new messages, withdrawn skipped")
+
+    check([x["Id"] for x in new_by_id([{"Id": 1}, {"Id": 2}], {"1"})] == [2], "new by id")
+
+    def les(i, name, subj="Fizyka", **flags):
+        pt = None if name is None else dict({"Id": hash(name) % 100, "Name": name}, **flags)
+        return {"Id": i, "PresenceType": pt, "Subject": {"Name": subj}, "CalculatePresence": True}
+
+    present = les(1, "obecność", Presence=True)
+    absent  = les(2, "nieobecność", Absence=True)
+    late    = les(3, "spóźnienie", Presence=True, Late=True)
+    trip    = les(4, "wyjście szkolne", Presence=True)
+    noclass = les(5, "lekcja się nie odbyła")
+    empty   = les(6, None)
+    check(presence_issue(absent) == "nieobecność" and presence_issue(late) == "spóźnienie", "issues")
+    check(presence_issue(present) is None and presence_issue(empty) is None, "no issue")
+    ls = [present, absent, late, trip, noclass, empty, les(7, "obecność", "Chemia", Presence=True)]
+    st = attendance_stats(ls)
+    check(st[""] == (4, 5) and st["Fizyka"] == (3, 4) and st["Chemia"] == (1, 1), str(st))
+    ch = attendance_changes(ls, {"3": late["PresenceType"]["Id"]})
+    check([l["Id"] for l in ch] == [2], "only new absence flagged")
+
+    summ = [{"Id": 9, "Entry_1": "4", "Entry_2": None}, {"Id": 8, "Entry_1": None, "Entry_2": None}]
+    check(summary_changes(summ, {}) == [(summ[0], "proponowana", "4")], "proposed appears")
+    check(summary_changes(summ, summary_state(summ)) == [], "no change")
+    summ2 = [{"Id": 9, "Entry_1": "4", "Entry_2": "5"}]
+    check([c[1:] for c in summary_changes(summ2, summary_state(summ))] == [("końcowa", "5")], "final appears")
 
     print(f"selftest OK — {checks} checks")
     return 0

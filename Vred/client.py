@@ -198,6 +198,31 @@ class VulcanClient:
         except Exception:
             return None
 
+    def get_homework(self, date_from: datetime, date_to: datetime) -> list:
+        url = (
+            f"{self._rest_url}/{self._symbol()}/api/mobile/homework/byPupil"
+            f"?unitId={self._unit_id()}&pupilId={self._pupil_id()}"
+            f"&dateFrom={date_from:%Y-%m-%d}&dateTo={date_to:%Y-%m-%d}&pageSize=500"
+        )
+        return self._get(url)["Envelope"]
+
+    def get_attendance(self, date_from: datetime, date_to: datetime) -> list:
+        """lesson/byPupil — odbyte lekcje z PresenceType i tematem (Topic)."""
+        url = (
+            f"{self._rest_url}/{self._symbol()}/api/mobile/lesson/byPupil"
+            f"?unitId={self._unit_id()}&pupilId={self._pupil_id()}"
+            f"&dateFrom={date_from:%Y-%m-%d}&dateTo={date_to:%Y-%m-%d}&pageSize=1000"
+        )
+        return self._get(url)["Envelope"]
+
+    def get_notes(self) -> list:
+        """Uwagi i osiagniecia (Positive, Category, Content, Creator, Points)."""
+        url = (
+            f"{self._rest_url}/{self._symbol()}/api/mobile/note/byPupil"
+            f"?unitId={self._unit_id()}&pupilId={self._pupil_id()}&pageSize=500"
+        )
+        return self._get(url)["Envelope"]
+
     def get_messages(self, kind: str = "received", page_size: int = 100) -> list:
         """kind: received | sent | deleted. Odczyt listy NIE oznacza wiadomosci jako przeczytanej."""
         box = self._pupil["MessageBox"]["GlobalKey"]

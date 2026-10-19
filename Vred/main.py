@@ -32,6 +32,7 @@ SEEN_GRADES_FILE  = DATA_DIR / "seen_grades.json"
 REMINDER_FILE     = DATA_DIR / "reminder_state.json"
 CREDENTIALS_FILE  = DATA_DIR / "credentials.json"
 SEEN_MESSAGES_FILE = DATA_DIR / "seen_messages.json"
+SEEN_SCHOOL_FILE  = DATA_DIR / "seen_school.json"
 MESSAGES_INTERVAL = int(os.getenv("MESSAGES_INTERVAL", 15))
 DAILY_HOUR        = int(os.getenv("DAILY_HOUR", 7))
 REMINDER_HOUR     = int(os.getenv("REMINDER_HOUR", 19))
@@ -392,6 +393,7 @@ async def build_reminder(now: datetime) -> discord.Embed | None:
     t_str    = tomorrow.strftime("%Y-%m-%d")
     exams    = await asyncio.to_thread(client.get_exams, tomorrow, tomorrow + timedelta(days=7))
     lessons  = await asyncio.to_thread(client.get_lessons, tomorrow, tomorrow)
+    homework = await asyncio.to_thread(client.get_homework, tomorrow, tomorrow)
 
     embed = discord.Embed(title=f"🔔 Jutro — {fmt_date(t_str)}", color=VRED_COLOR)
     t_exams = [e for e in exams if exam_date(e) == t_str]
@@ -403,6 +405,10 @@ async def build_reminder(now: datetime) -> discord.Embed | None:
                             for e in t_exams)[:1024],
             inline=False,
         )
+    t_hw = [h for h in homework if (h.get("DeadlineAt") or "")[:10] == t_str]
+    if t_hw:
+        embed.add_field(name=f"📚 Zadania domowe ({len(t_hw)})",
+                        value="\n".join(homework_line(h) for h in t_hw)[:1024], inline=False)
     changes = []
     for v in sorted((logic.lesson_view(l) for l in lessons if lesson_date(l) == t_str),
                     key=lambda v: v["pos"]):
@@ -569,6 +575,133 @@ async def before_messages():
 
 
 # ---------------------------------------------------------------------------
+# Zadania domowe (kanal), frekwencja / uwagi / oceny proponowane (DM)
+# ---------------------------------------------------------------------------
+
+def homework_line(h: dict) -> str:
+    subject = (h.get("Subject") or {}).get("Name", "?")
+    return f"**{subject}** — {logic.html_to_text(h.get('Content'))[:300] or 'brak opisu'}"
+
+
+def homework_embed(h: dict) -> discord.Embed:
+    subject = (h.get("Subject") or {}).get("Name", "?")
+    deadline = (h.get("DeadlineAt") or "")[:10]
+    embed = discord.Embed(
+        title=f"📚 Zadanie domowe — {subject}",
+        description=logic.html_to_text(h.get("Content"))[:4000] or None,
+        color=subject_color(subject),
+    )
+    embed.add_field(name="Termin", value=fmt_date(deadline) if deadline else "?", inline=True)
+    if h.get("IsAnswerRequired"):
+        embed.add_field(name="Odpowiedź", value="wymagana w eduVULCAN", inline=True)
+    if h.get("Attachments"):
+        embed.add_field(name="Załączniki", value=f"{len(h['Attachments'])} — otwórz w eduVULCAN", inline=True)
+    embed.set_footer(text=f"{(h.get('Creator') or {}).get('DisplayName', '')} • Vred")
+    return embed
+
+
+def attendance_embed(l: dict) -> discord.Embed:
+    subject = (l.get("Subject") or {}).get("Name", "?")
+    slot    = l.get("TimeSlot") or {}
+    embed = discord.Embed(
+        title=f"🚸 {logic.presence_issue(l).capitalize()} — {subject}",
+        description=f"{fmt_date(l.get('DayAt') or '')}, lekcja {slot.get('Position', '?')} ({slot.get('Display', '?')})",
+        color=0xE5534B,
+    )
+    if l.get("Topic"):
+        embed.add_field(name="Temat", value=l["Topic"][:1024], inline=False)
+    embed.set_footer(text="Vred")
+    return embed
+
+
+def note_embed(n: dict) -> discord.Embed:
+    positive = bool(n.get("Positive"))
+    embed = discord.Embed(
+        title=f"{'🌟 Pochwała' if positive else '⚠️ Uwaga'} — {(n.get('Category') or {}).get('Name') or 'bez kategorii'}",
+        description=logic.html_to_text(n.get("Content"))[:4000] or None,
+        color=0x3FB950 if positive else 0xE5534B,
+    )
+    if n.get("Points"):
+        embed.add_field(name="Punkty", value=str(n["Points"]), inline=True)
+    embed.set_footer(text=f"{(n.get('Creator') or {}).get('DisplayName', '')} • Vred")
+    return embed
+
+
+def current_period_start() -> datetime:
+    for p in get_client().periods:
+        if p.get("Current") and p.get("StartAt"):
+            return CET.localize(datetime.strptime(p["StartAt"], "%Y-%m-%d"))
+    return datetime.now(CET) - timedelta(days=60)
+
+
+async def _check_section(name: str, state: dict, fn):
+    """Kazda sekcja osobno — blad jednego endpointu nie blokuje reszty.
+    Brak sekcji w stanie = pierwszy przebieg, tylko zapamietuje (bez zalewu historia)."""
+    try:
+        state[name] = await fn(name not in state, state.get(name))
+    except Exception as e:
+        print(f"[check_school:{name}] {e}")
+
+
+@tasks.loop(minutes=CHECK_INTERVAL)
+async def check_school():
+    client = get_client()
+    now    = datetime.now(CET)
+    state  = load_json(SEEN_SCHOOL_FILE, {})
+    owner  = await bot.fetch_user(OWNER_ID)
+
+    async def homework(first, seen):
+        items = await asyncio.to_thread(client.get_homework, now - timedelta(days=7), now + timedelta(days=60))
+        seen = set(seen or [])
+        channel = discord.utils.get(bot.get_all_channels(), name=EXAMS_CHANNEL)
+        if not first and channel:
+            for h in logic.new_by_id(items, seen)[:10]:
+                await channel.send(embed=homework_embed(h))
+        elif not first:
+            return sorted(seen)  # bez kanalu nie oznaczaj jako wyslane
+        return sorted(seen | {str(h.get("Id")) for h in items})
+
+    async def attendance(first, seen):
+        lessons = await asyncio.to_thread(client.get_attendance, now - timedelta(days=14), now)
+        seen = seen or {}
+        if not first:
+            for l in logic.attendance_changes(lessons, seen)[:10]:
+                await owner.send(embed=attendance_embed(l))
+        seen.update({str(l.get("Id")): (l.get("PresenceType") or {}).get("Id")
+                     for l in lessons if l.get("PresenceType")})
+        return seen
+
+    async def notes(first, seen):
+        items = await asyncio.to_thread(client.get_notes)
+        seen = set(seen or [])
+        if not first:
+            for n in logic.new_by_id(items, seen)[:10]:
+                await owner.send(embed=note_embed(n))
+        return sorted(seen | {str(n.get("Id")) for n in items})
+
+    async def summary(first, seen):
+        items = await asyncio.to_thread(client.get_grades_summary)
+        if not first:
+            for s, label, val in logic.summary_changes(items, seen or {})[:10]:
+                subject = (s.get("Subject") or {}).get("Name", "?")
+                await owner.send(embed=discord.Embed(
+                    title=f"🏁 Ocena {label}: {val} — {subject}",
+                    color=subject_color(subject),
+                ).set_footer(text="Vred"))
+        return logic.summary_state(items)
+
+    for name, fn in (("homework", homework), ("attendance", attendance),
+                     ("notes", notes), ("summary", summary)):
+        await _check_section(name, state, fn)
+    save_json(SEEN_SCHOOL_FILE, state)
+
+
+@check_school.before_loop
+async def before_school():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
 
@@ -586,6 +719,9 @@ async def slash_commands(interaction: discord.Interaction):
     embed.add_field(name="/sprawdziany", value="Nadchodzące sprawdziany",          inline=False)
     embed.add_field(name="/nastepny",    value="Czas do następnego sprawdzianu",   inline=False)
     embed.add_field(name="/srednie",     value="Średnie ważone i oceny (owner only, prywatnie)", inline=False)
+    embed.add_field(name="/zadania",     value="Zadania domowe na najbliższe dni", inline=False)
+    embed.add_field(name="/tematy",      value="Tematy lekcji z wybranego dnia (0 = dziś, -1 = wczoraj)", inline=False)
+    embed.add_field(name="/frekwencja",  value="Frekwencja w bieżącym okresie (owner only, prywatnie)", inline=False)
     embed.add_field(name="/wiadomosci",  value="Ostatnie wiadomości z dziennika (owner only, prywatnie)", inline=False)
     embed.add_field(name="/setup",       value="Utwórz kanały plan-lekcji i sprawdziany", inline=False)
     embed.add_field(name="/info",        value="Status bota (owner only)",         inline=False)
@@ -716,6 +852,75 @@ async def slash_nastepny(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
+
+
+@bot.tree.command(name="zadania", description="Zadania domowe na najbliższe dni (domyślnie 14)")
+async def slash_zadania(interaction: discord.Interaction, dni: int = 14):
+    await interaction.response.defer()
+    try:
+        now   = datetime.now(CET)
+        items = await asyncio.to_thread(get_client().get_homework, now, now + timedelta(days=max(1, min(dni, 60))))
+        items = sorted(items, key=lambda h: h.get("DeadlineAt") or "")
+        if not items:
+            await interaction.followup.send(f"Brak zadań domowych na {dni} dni. 🎉")
+            return
+        embed = discord.Embed(title=f"📚 Zadania domowe — {dni} dni", color=VRED_COLOR)
+        for h in items[:25]:
+            embed.add_field(name=fmt_date((h.get("DeadlineAt") or "")[:10]),
+                            value=homework_line(h)[:1024], inline=False)
+        embed.set_footer(text="Vred • eduVulcan bot")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ `{e}`")
+
+
+@bot.tree.command(name="tematy", description="Tematy lekcji z dnia (0 = dziś, -1 = wczoraj)")
+async def slash_tematy(interaction: discord.Interaction, offset: int = 0):
+    await interaction.response.defer()
+    try:
+        day     = datetime.now(CET) + timedelta(days=offset)
+        lessons = await asyncio.to_thread(get_client().get_attendance, day, day)
+        lessons = sorted(lessons, key=lambda l: (l.get("TimeSlot") or {}).get("Position", 99))
+        d_str   = day.strftime("%Y-%m-%d")
+        if not lessons:
+            await interaction.followup.send(f"Brak wpisanych lekcji na {fmt_date(d_str)}.")
+            return
+        lines = [f"`{(l.get('TimeSlot') or {}).get('Position', '?')}.` **{(l.get('Subject') or {}).get('Name', '?')}** — "
+                 f"{l.get('Topic') or '*brak tematu*'}" for l in lessons]
+        embed = discord.Embed(title=f"🧾 Tematy — {fmt_date(d_str)}", description="\n".join(lines)[:4000], color=VRED_COLOR)
+        embed.set_footer(text="Vred • eduVulcan bot")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ `{e}`")
+
+
+@bot.tree.command(name="frekwencja", description="Frekwencja w bieżącym okresie (tylko właściciel, widzisz tylko ty)")
+async def slash_frekwencja(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Tylko właściciel może zobaczyć frekwencję.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        lessons = await asyncio.to_thread(get_client().get_attendance, current_period_start(), datetime.now(CET))
+        stats   = logic.attendance_stats(lessons)
+        if "" not in stats:
+            await interaction.followup.send("Brak danych o frekwencji w tym okresie.", ephemeral=True)
+            return
+        pct = lambda p, n: f"{100 * p / n:.1f}%"
+        p, n = stats.pop("")
+        rows = sorted(stats.items(), key=lambda kv: kv[1][0] / kv[1][1])
+        embed = discord.Embed(title=f"🚸 Frekwencja: {pct(p, n)} ({p}/{n})", color=VRED_COLOR,
+                              description="\n".join(f"{'⚠️ ' if sp / sn < 0.5 else ''}**{s}** — {pct(sp, sn)} ({sp}/{sn})"
+                                                    for s, (sp, sn) in rows)[:4000])
+        issues = [l for l in lessons if logic.presence_issue(l)]
+        if issues:
+            embed.add_field(name=f"Nieobecności i spóźnienia ({len(issues)})", inline=False, value="\n".join(
+                f"{fmt_date(l.get('DayAt') or '')} — {(l.get('Subject') or {}).get('Name', '?')}: {logic.presence_issue(l)}"
+                for l in sorted(issues, key=lambda l: l.get("DayAt") or "", reverse=True)[:15])[:1024])
+        embed.set_footer(text="Vred • liczone: obecny / (obecny + nieobecny)")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
 
 
 @bot.tree.command(name="wiadomosci", description="Ostatnie wiadomości z dziennika (tylko właściciel, widzisz tylko ty)")
@@ -1000,7 +1205,7 @@ async def on_ready():
     if daily_schedule.is_running():
         return
     for loop in (daily_schedule, check_exams, rotate_status, uptime_ping,
-                 calendar_sync_task, evening_reminder, check_grades, check_messages):
+                 calendar_sync_task, evening_reminder, check_grades, check_messages, check_school):
         loop.start()
     asyncio.create_task(run_calendar_sync("startup"))
 

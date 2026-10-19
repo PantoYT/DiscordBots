@@ -18,6 +18,10 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
 - ⚠️ **Busy days**: warns when two or more exams fall on the same day
 - 🎓 **Grade alerts**: DMs the owner about new or changed grades, with the subject average before → after
 - ✉️ **Message alerts**: DMs the owner every new eduVULCAN message (checked every `MESSAGES_INTERVAL` minutes); reading the list does not mark messages as read
+- 📚 **Homework**: posts new homework to the exams channel; tomorrow's homework is part of the evening reminder
+- 🚸 **Attendance alerts**: DMs the owner when a lesson is marked absent or late
+- 🏁 **Proposed / final grades**: DMs the owner when a proposed or final grade appears or changes
+- 🌟 **Notes**: DMs the owner about new uwagi / pochwały
 
 ## Available Commands
 - `/plan` — Lesson plan for today
@@ -26,6 +30,9 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
 - `/sprawdziany [tygodnie]` — Upcoming exams (default 2 weeks)
 - `/nastepny` — Time until the next exam
 - `/srednie` — Weighted averages for the current period (owner only, ephemeral)
+- `/zadania [dni]` — Homework due in the next N days (default 14)
+- `/tematy [offset]` — Lesson topics for a day (0 = today, -1 = yesterday)
+- `/frekwencja` — Attendance in the current period, per subject (owner only, ephemeral)
 - `/wiadomosci [ile]` — Latest eduVULCAN messages (owner only, ephemeral, max 10)
 
 ### Owner Commands
