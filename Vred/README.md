@@ -22,6 +22,7 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
 - 🚸 **Attendance alerts**: DMs the owner when a lesson is marked absent or late
 - 🏁 **Proposed / final grades**: DMs the owner when a proposed or final grade appears or changes
 - 🌟 **Notes**: DMs the owner about new uwagi / pochwały
+- 🧠 **AI study help** (optional, free): `/powtorka` builds a revision sheet for the next exam and `/szukaj` answers a question — both search the web first and list their sources (Groq, `openai/gpt-oss-120b` with `browser_search`)
 
 ## Available Commands
 - `/plan` — Lesson plan for today
@@ -30,6 +31,8 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
 - `/sprawdziany [tygodnie]` — Upcoming exams (default 2 weeks)
 - `/nastepny` — Time until the next exam
 - `/srednie` — Weighted averages for the current period (owner only, ephemeral)
+- `/powtorka [przedmiot]` — AI revision for the next exam (or the next one of that subject), with sources
+- `/szukaj <pytanie>` — AI answer grounded in a web search, with sources
 - `/zadania [dni]` — Homework due in the next N days (default 14)
 - `/tematy [offset]` — Lesson topics for a day (0 = today, -1 = yesterday)
 - `/frekwencja` — Attendance in the current period, per subject (owner only, ephemeral)
@@ -48,6 +51,8 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
    - `EXAMS_CHANNEL` — Channel name for exam notifications (default: `sprawdziany`)
    - `CHECK_INTERVAL` — How often to check for new exams in minutes (default: `60`)
    - `MESSAGES_INTERVAL` — How often to check for new messages in minutes (default: `15`)
+   - `GROQ_API_KEY` — optional, enables `/powtorka` and `/szukaj`; free key at https://console.groq.com/keys (no card)
+   - `GROQ_MODEL` / `GROQ_FALLBACK_MODEL` — defaults `openai/gpt-oss-120b` / `openai/gpt-oss-20b`; the free tier limits tokens per minute per model, so the fallback answers while the main one cools down
 2. Install all required Python packages from `requirements.txt`:
    ```bash
    py -3.12 -m pip install -r requirements.txt -r requirements-register.txt

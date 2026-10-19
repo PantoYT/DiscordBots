@@ -11,6 +11,7 @@ import requests as req
 from pathlib import Path
 
 from client import VulcanClient
+import ai
 import calendar_sync
 import logic
 
@@ -719,6 +720,8 @@ async def slash_commands(interaction: discord.Interaction):
     embed.add_field(name="/sprawdziany", value="Nadchodzące sprawdziany",          inline=False)
     embed.add_field(name="/nastepny",    value="Czas do następnego sprawdzianu",   inline=False)
     embed.add_field(name="/srednie",     value="Średnie ważone i oceny (owner only, prywatnie)", inline=False)
+    embed.add_field(name="/powtorka",    value="Powtórka do najbliższego sprawdzianu (AI + źródła), opcjonalnie przedmiot", inline=False)
+    embed.add_field(name="/szukaj",      value="Pytanie do AI z wyszukiwarką, odpowiedź ze źródłami", inline=False)
     embed.add_field(name="/zadania",     value="Zadania domowe na najbliższe dni", inline=False)
     embed.add_field(name="/tematy",      value="Tematy lekcji z wybranego dnia (0 = dziś, -1 = wczoraj)", inline=False)
     embed.add_field(name="/frekwencja",  value="Frekwencja w bieżącym okresie (owner only, prywatnie)", inline=False)
@@ -850,6 +853,59 @@ async def slash_nastepny(interaction: discord.Interaction):
         )
         embed.set_footer(text="Vred • eduVulcan bot")
         await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ `{e}`")
+
+
+def ai_embed(title: str, text: str, sources: list) -> discord.Embed:
+    if len(text) > 3800:
+        text = text[:3800] + "\n…(ucięte)"
+    embed = discord.Embed(title=title[:256], description=text or "(pusta odpowiedź)", color=VRED_COLOR)
+    if sources:
+        embed.add_field(name="Źródła", inline=False, value="\n".join(
+            f"[{i}] [{t[:80]}]({u})" for i, (t, u) in enumerate(sources[:8], 1))[:1024])
+    embed.set_footer(text=f"Groq • {ai.MODEL} • AI może się mylić — sprawdź w źródłach")
+    return embed
+
+
+@bot.tree.command(name="powtorka", description="Powtórka do najbliższego sprawdzianu (AI + wyszukiwarka)")
+async def slash_powtorka(interaction: discord.Interaction, przedmiot: str = ""):
+    if not ai.enabled():
+        await interaction.response.send_message("AI wyłączone — brak `GROQ_API_KEY` w .env.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        now   = datetime.now(CET)
+        exams = await asyncio.to_thread(get_client().get_exams, now, now + timedelta(weeks=4))
+        exams = sorted(exams, key=lambda e: exam_date(e) or "9999")
+        if przedmiot:
+            exams = [e for e in exams if przedmiot.lower() in exam_label(e).lower()]
+        if not exams:
+            await interaction.followup.send(f"Brak nadchodzących sprawdzianów{f' z „{przedmiot}”' if przedmiot else ''}.")
+            return
+        exam    = exams[0]
+        subject = (exam.get("Subject") or {}).get("Name", "?")
+        topic   = (exam.get("Content") or "").strip() or "brak opisu — tylko nazwa przedmiotu"
+        prompt  = (f"Przedmiot: {subject}. Rodzaj: {(exam.get('Type') or 'sprawdzian').lower()}. "
+                   f"Zakres podany przez nauczyciela: {topic}\n\n"
+                   "Przygotuj powtórkę: 1) najważniejsze zagadnienia i wzory w punktach (max ~12), "
+                   "2) 5 pytań kontrolnych, a odpowiedź do każdego zapisz w spoilerze Discorda ||tak||.")
+        text, sources = await asyncio.to_thread(ai.ask, prompt)
+        title = f"🧠 Powtórka: {exam_label(exam)} — {fmt_date(exam_date(exam))}"
+        await interaction.followup.send(embed=ai_embed(title, text, sources))
+    except Exception as e:
+        await interaction.followup.send(f"❌ `{e}`")
+
+
+@bot.tree.command(name="szukaj", description="Zapytaj AI z wyszukiwarką (jak przegląd AI w Google)")
+async def slash_szukaj(interaction: discord.Interaction, pytanie: str):
+    if not ai.enabled():
+        await interaction.response.send_message("AI wyłączone — brak `GROQ_API_KEY` w .env.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        text, sources = await asyncio.to_thread(ai.ask, pytanie, 1000)
+        await interaction.followup.send(embed=ai_embed(f"🔎 {pytanie}", text, sources))
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
 

@@ -4,7 +4,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY client.py logic.py calendar_sync.py main.py ./
+COPY client.py logic.py calendar_sync.py ai.py main.py ./
 RUN python logic.py
 
 # Secrets and state live on the volume, never in the image.

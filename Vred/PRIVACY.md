@@ -24,6 +24,11 @@ Where that data goes:
   own privacy policy.
 - If Google Calendar sync is configured, the timetable is written to the
   owner's Google Calendar and is subject to Google's privacy policy.
+- If GROQ_API_KEY is configured, /powtorka sends the subject, type and
+  teacher's description of an exam to Groq, and /szukaj sends the question
+  typed by the user. Groq runs a web search for it. Nothing else (grades,
+  attendance, messages, names) is sent. This is subject to Groq's privacy
+  policy; answers are posted in the channel where the command was used.
 - Vred does not sell or share data with anyone else.
 
 What Vred stores on the host machine:

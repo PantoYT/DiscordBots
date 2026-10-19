@@ -243,6 +243,64 @@ def summary_state(summary) -> dict[str, list]:
     return {str(s.get("Id")): [s.get("Entry_1"), s.get("Entry_2")] for s in summary}
 
 
+# --------------------------------------------------------------------------- #
+# AI answers — Groq browser_search: 【k†Lx-Ly】 points at executed_tools[k]
+# --------------------------------------------------------------------------- #
+
+def _tool_url(t: dict) -> str | None:
+    res = ((t.get("search_results") or {}).get("results") or [])
+    if res and res[0].get("url"):
+        return res[0]["url"]
+    m = re.search(r"URL: (\S+)", t.get("output") or "")
+    return m.group(1) if m else None
+
+
+def cite_sources(content: str, tools: list) -> tuple[str, list[tuple[str, str]]]:
+    """Replace 【k†…】 with [n] and return the opened pages as numbered sources.
+    Pages opened but never cited are still listed — the answer was built on them."""
+    sources: list[tuple[str, str]] = []
+    number: dict[int, int] = {}
+    for i, t in enumerate(tools):
+        if t.get("type") != "browser.open":
+            continue
+        url = _tool_url(t)
+        if not url:
+            continue
+        if url not in [u for _, u in sources]:
+            title = (((t.get("search_results") or {}).get("results") or [{}])[0].get("title") or url)
+            sources.append((re.sub(r"\s+-\s+viewing lines.*$", "", title).strip(), url))
+        number[i] = [u for _, u in sources].index(url) + 1
+
+    def repl(m):
+        n = number.get(int(m.group(1)))
+        return f"[{n}]" if n else ""
+
+    text = re.sub(r"【(\d+)†[^】]*】", repl, content or "")
+    text = re.sub(r"(\[\d+\])(?:\1)+", r"\1", text)
+    return text.strip(), sources
+
+
+def tables_to_lists(text: str) -> str:
+    """Discord nie renderuje tabel Markdowna ani <br> — wiersz tabeli -> punkt listy."""
+    out, header = [], None
+    for line in (text or "").split("\n"):
+        st = line.strip()
+        if not (st.startswith("|") and st.endswith("|") and st.count("|") >= 3):
+            header = None
+            out.append(line)
+            continue
+        cells = [c.strip() for c in st.strip("|").split("|")]
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+            continue
+        if header is None:
+            header = cells
+            continue
+        cells = [re.sub(r"(?i)<br\s*/?>", "; ", c) for c in cells]
+        cells = [c for c in cells if c and not re.fullmatch(r"\d+|\[\d+\]", c)] or cells
+        out.append("• " + " — ".join(cells))
+    return re.sub(r"(?i)<br\s*/?>", "\n", "\n".join(out))
+
+
 def new_messages(messages, seen: set[str]) -> list[dict]:
     """Unseen, not withdrawn, oldest first."""
     fresh = [m for m in messages
@@ -346,6 +404,19 @@ def selftest() -> int:
     check(summary_changes(summ, summary_state(summ)) == [], "no change")
     summ2 = [{"Id": 9, "Entry_1": "4", "Entry_2": "5"}]
     check([c[1:] for c in summary_changes(summ2, summary_state(summ))] == [("końcowa", "5")], "final appears")
+
+    tools = [{"type": "browser_search", "output": "URL: https://exa.ai/search?q=x"},
+             {"type": "browser.open", "search_results": {"results": [
+                 {"title": "www.matemaks.pl - viewing lines [0 - 193] of 193", "url": "https://matemaks.pl/a"}]}},
+             {"type": "browser.open", "output": "L1: URL: https://cke.edu.pl/b\nL2: x"},
+             {"type": "browser.open", "search_results": {"results": [{"title": "dup", "url": "https://matemaks.pl/a"}]}}]
+    text, src = cite_sources("Wzór【1†L6-L8】【1†L9】. Wierzchołek【2†L6】【3†L1】【0†L2】.", tools)
+    check(text == "Wzór[1]. Wierzchołek[2][1].", repr(text))
+    check(src == [("www.matemaks.pl", "https://matemaks.pl/a"), ("https://cke.edu.pl/b", "https://cke.edu.pl/b")], str(src))
+
+    tbl = "Wstęp\n| # | Pojęcie | Opis |\n|---|:---|---|\n| 1 | **Integracja** | łączenie<br>państw [1] |\n| 2 | UE | 27 państw |\nKoniec"
+    check(tables_to_lists(tbl) == "Wstęp\n• **Integracja** — łączenie; państw [1]\n• UE — 27 państw\nKoniec", repr(tables_to_lists(tbl)))
+    check(tables_to_lists("a | b") == "a | b", "pipe in prose untouched")
 
     print(f"selftest OK — {checks} checks")
     return 0
