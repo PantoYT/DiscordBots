@@ -388,7 +388,8 @@ async def check_exams():
 # Wieczorne przypomnienie — co jutro (sprawdziany + zmiany w planie)
 # ---------------------------------------------------------------------------
 
-async def build_reminder(now: datetime) -> discord.Embed | None:
+async def build_reminder(now: datetime) -> tuple[discord.Embed | None, list]:
+    """(embed, jutrzejsze sprawdziany) — sprawdziany dostaja przyciski powtorki."""
     client   = get_client()
     tomorrow = now + timedelta(days=1)
     t_str    = tomorrow.strftime("%Y-%m-%d")
@@ -429,9 +430,9 @@ async def build_reminder(now: datetime) -> discord.Embed | None:
             embed.add_field(name="🗓️ Ten tydzień", value="\n".join(lines)[:1024], inline=False)
 
     if not embed.fields:
-        return None
+        return None, []
     embed.set_footer(text="Vred • eduVulcan bot")
-    return embed
+    return embed, t_exams
 
 
 @tasks.loop(minutes=1)
@@ -447,9 +448,10 @@ async def evening_reminder():
     if not channel:
         return
     try:
-        embed = await build_reminder(now)
+        embed, t_exams = await build_reminder(now)
         if embed:
-            await channel.send(embed=embed)
+            view = powtorka_view(t_exams)
+            await channel.send(embed=embed, **({"view": view} if view else {}))
         # Zapis dopiero po sukcesie — przy bledzie Vulcana sprobuje za minute.
         save_json(REMINDER_FILE, {"last": today})
     except Exception as e:
@@ -868,6 +870,71 @@ def ai_embed(title: str, text: str, sources: list) -> discord.Embed:
     return embed
 
 
+# Jedna powtorka zjada 10-60k tokenow przy limicie 8k/min — wynik trzymamy w pamieci,
+# a lock sprawia, ze dwa klikniecia naraz generuja ja raz.
+_powtorka_cache: dict[str, discord.Embed] = {}
+_powtorka_locks: dict[str, asyncio.Lock] = {}
+
+
+async def powtorka_embed(exam: dict) -> discord.Embed:
+    subject = (exam.get("Subject") or {}).get("Name", "?")
+    topic   = (exam.get("Content") or "").strip() or "brak opisu — tylko nazwa przedmiotu"
+    key     = f"{exam.get('Id')}:{topic}"
+    async with _powtorka_locks.setdefault(key, asyncio.Lock()):
+        if key not in _powtorka_cache:
+            prompt = (f"Przedmiot: {subject}. Rodzaj: {(exam.get('Type') or 'sprawdzian').lower()}. "
+                      f"Zakres podany przez nauczyciela: {topic}\n\n"
+                      "Przygotuj powtórkę: 1) najważniejsze zagadnienia i wzory w punktach (max ~12), "
+                      "2) 5 pytań kontrolnych, a odpowiedź do każdego zapisz w spoilerze Discorda ||tak||.")
+            text, sources = await asyncio.to_thread(ai.ask, prompt)
+            title = f"🧠 Powtórka: {exam_label(exam)} — {fmt_date(exam_date(exam))}"
+            _powtorka_cache[key] = ai_embed(title, text, sources)
+    return _powtorka_cache[key]
+
+
+class PowtorkaButton(discord.ui.DynamicItem[discord.ui.Button], template=r"vred:powtorka:(?P<id>\d+)"):
+    """Przycisk pod wieczornym przypomnieniem; custom_id niesie Id sprawdzianu,
+    wiec dziala tez po restarcie bota."""
+
+    def __init__(self, exam_id: int, label: str = "Powtórka"):
+        super().__init__(discord.ui.Button(
+            label=label[:80], emoji="🧠", style=discord.ButtonStyle.primary,
+            custom_id=f"vred:powtorka:{exam_id}"))
+        self.exam_id = exam_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["id"]), item.label or "Powtórka")
+
+    async def callback(self, interaction: discord.Interaction):
+        if not ai.enabled():
+            await interaction.response.send_message("AI wyłączone — brak `GROQ_API_KEY` w .env.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            now   = datetime.now(CET)
+            exams = await asyncio.to_thread(get_client().get_exams, now - timedelta(days=1), now + timedelta(weeks=8))
+            exam  = next((e for e in exams if e.get("Id") == self.exam_id), None)
+            if not exam:
+                await interaction.followup.send("Tego sprawdzianu już nie ma w dzienniku.")
+                return
+            await interaction.followup.send(embed=await powtorka_embed(exam))
+        except Exception as e:
+            await interaction.followup.send(f"❌ `{e}`")
+
+
+bot.add_dynamic_items(PowtorkaButton)
+
+
+def powtorka_view(exams: list) -> discord.ui.View | None:
+    if not ai.enabled() or not exams:
+        return None
+    view = discord.ui.View(timeout=None)
+    for e in exams[:5]:
+        view.add_item(PowtorkaButton(e["Id"], f"Powtórka: {(e.get('Subject') or {}).get('Name', '?')}"))
+    return view
+
+
 @bot.tree.command(name="powtorka", description="Powtórka do najbliższego sprawdzianu (AI + wyszukiwarka)")
 async def slash_powtorka(interaction: discord.Interaction, przedmiot: str = ""):
     if not ai.enabled():
@@ -883,16 +950,7 @@ async def slash_powtorka(interaction: discord.Interaction, przedmiot: str = ""):
         if not exams:
             await interaction.followup.send(f"Brak nadchodzących sprawdzianów{f' z „{przedmiot}”' if przedmiot else ''}.")
             return
-        exam    = exams[0]
-        subject = (exam.get("Subject") or {}).get("Name", "?")
-        topic   = (exam.get("Content") or "").strip() or "brak opisu — tylko nazwa przedmiotu"
-        prompt  = (f"Przedmiot: {subject}. Rodzaj: {(exam.get('Type') or 'sprawdzian').lower()}. "
-                   f"Zakres podany przez nauczyciela: {topic}\n\n"
-                   "Przygotuj powtórkę: 1) najważniejsze zagadnienia i wzory w punktach (max ~12), "
-                   "2) 5 pytań kontrolnych, a odpowiedź do każdego zapisz w spoilerze Discorda ||tak||.")
-        text, sources = await asyncio.to_thread(ai.ask, prompt)
-        title = f"🧠 Powtórka: {exam_label(exam)} — {fmt_date(exam_date(exam))}"
-        await interaction.followup.send(embed=ai_embed(title, text, sources))
+        await interaction.followup.send(embed=await powtorka_embed(exams[0]))
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
 

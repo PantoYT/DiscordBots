@@ -14,7 +14,7 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
 - ⏰ **Next Exam**: Quick look at what's coming up first
 - 🔔 **Auto Notifications**: Bot automatically checks for new exams every hour and posts them to your channel
 - 🔀 **Substitution details**: shows what replaces a lesson (subject, teacher) and why it was cancelled
-- 🌙 **Evening reminder**: at `REMINDER_HOUR` (default 19:00) posts tomorrow's exams with topics and timetable changes; on Sundays also a preview of the week
+- 🌙 **Evening reminder**: at `REMINDER_HOUR` (default 19:00) posts tomorrow's exams with topics and timetable changes; on Sundays also a preview of the week; with `GROQ_API_KEY` set, every exam gets a 🧠 *Powtórka* button that generates the AI revision on click (cached, so a second click costs nothing)
 - ⚠️ **Busy days**: warns when two or more exams fall on the same day
 - 🎓 **Grade alerts**: DMs the owner about new or changed grades, with the subject average before → after
 - ✉️ **Message alerts**: DMs the owner every new eduVULCAN message (checked every `MESSAGES_INTERVAL` minutes); reading the list does not mark messages as read
