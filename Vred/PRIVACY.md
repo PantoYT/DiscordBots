@@ -1,14 +1,38 @@
 Privacy Policy for Vred - Vulcan Recurrent Education Dump
 
-Vred only collects the minimum information required to function:
-- Discord User IDs for command responses and owner verification.
+Vred is a self-hosted bot. It reads data from the bot owner's own eduVULCAN
+account through the unofficial eduVULCAN Hebe mobile API. All school data it
+shows belongs to that account.
 
-No user personal information is stored outside runtime memory.
-No data is shared with third parties.
+What Vred reads from eduVULCAN:
+- Timetable, substitutions and cancelled lessons
+- Exams and their topics
+- Grades and grade averages
+- Messages received in the eduVULCAN message box (subject, sender, content,
+  date). Reading them does not mark them as read in eduVULCAN.
 
-Vred uses the unofficial eduVULCAN Hebe mobile API to retrieve school schedule and exam data.
-All school data displayed belongs to the bot owner's eduVULCAN account.
+Where that data goes:
+- Timetable and exams are posted to the configured channels of the Discord
+  server Vred is in, so every member of that server can see them.
+- Grades and messages are private: they are sent only as direct messages to
+  the bot owner, and the /srednie and /wiadomosci commands work only for the
+  owner and reply ephemerally. Messages can contain personal data of teachers
+  and other people (names, school matters); keep the owner's DMs private.
+- Everything Vred posts passes through Discord and is subject to Discord's
+  own privacy policy.
+- If Google Calendar sync is configured, the timetable is written to the
+  owner's Google Calendar and is subject to Google's privacy policy.
+- Vred does not sell or share data with anyone else.
 
-Sensitive files (credentials.json, .env) are stored locally on the host machine and are never shared or transmitted.
+What Vred stores on the host machine:
+- Secrets: credentials.json (eduVULCAN device key), .env (Discord token),
+  google_calendar_token.json. Treat them like passwords.
+- State used to avoid duplicate alerts: seen_exams.json, seen_grades.json
+  (grade IDs and values), seen_messages.json (message IDs only, no content),
+  reminder_state.json, schedule_message.json.
+- Discord user IDs are used only to answer commands and check the owner.
+
+These files never leave the host and are never committed to the repository.
+Deleting them removes everything Vred keeps.
 
 By using Vred, you consent to this Privacy Policy.

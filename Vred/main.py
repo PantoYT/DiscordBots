@@ -31,6 +31,8 @@ SCHEDULE_MSG_FILE = DATA_DIR / "schedule_message.json"
 SEEN_GRADES_FILE  = DATA_DIR / "seen_grades.json"
 REMINDER_FILE     = DATA_DIR / "reminder_state.json"
 CREDENTIALS_FILE  = DATA_DIR / "credentials.json"
+SEEN_MESSAGES_FILE = DATA_DIR / "seen_messages.json"
+MESSAGES_INTERVAL = int(os.getenv("MESSAGES_INTERVAL", 15))
 DAILY_HOUR        = int(os.getenv("DAILY_HOUR", 7))
 REMINDER_HOUR     = int(os.getenv("REMINDER_HOUR", 19))
 CALENDAR_SYNC_HOUR = int(os.getenv("CALENDAR_SYNC_HOUR", 20))
@@ -514,6 +516,59 @@ async def before_grades():
 
 
 # ---------------------------------------------------------------------------
+# Wiadomosci z dziennika — DM do wlasciciela (dane osobowe, nie na kanal)
+# ---------------------------------------------------------------------------
+
+def fmt_sent(sent_at: str | None) -> str:
+    try:
+        return datetime.fromisoformat((sent_at or "")[:19]).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return sent_at or "?"
+
+
+def message_embed(m: dict, max_len: int = 4000) -> discord.Embed:
+    text = logic.html_to_text(m.get("Content"))
+    if len(text) > max_len:
+        text = text[:max_len] + "\n…(ucięte — pełna treść w eduVULCAN)"
+    embed = discord.Embed(
+        title=f"✉️ {(m.get('Subject') or '(bez tematu)')[:240]}",
+        description=text or None,
+        color=VRED_COLOR,
+    )
+    embed.set_author(name=(m.get("Sender") or {}).get("Name") or "?")
+    if m.get("Attachments"):
+        embed.add_field(name="Załączniki", value=f"{len(m['Attachments'])} — otwórz w eduVULCAN", inline=False)
+    embed.set_footer(text=f"{fmt_sent(m.get('SentAt'))} • Vred")
+    return embed
+
+
+@tasks.loop(minutes=MESSAGES_INTERVAL)
+async def check_messages():
+    try:
+        client = get_client()
+        messages = await asyncio.to_thread(client.get_messages)
+        first_run = not SEEN_MESSAGES_FILE.exists()
+        seen = set(load_json(SEEN_MESSAGES_FILE, []))
+        fresh = logic.new_messages(messages, seen)
+        if fresh and not first_run:
+            owner = await bot.fetch_user(OWNER_ID)
+            for m in fresh[:10]:
+                await owner.send(embed=message_embed(m))
+            if len(fresh) > 10:
+                await owner.send(f"…i jeszcze {len(fresh) - 10} wiadomości — `/wiadomosci`.")
+        # Pierwszy przebieg tylko zapamietuje skrzynke, zeby nie zasypac DM-a historia.
+        seen.update(str(m.get("Id")) for m in messages)
+        save_json(SEEN_MESSAGES_FILE, sorted(seen))
+    except Exception as e:
+        print(f"[check_messages] {e}")
+
+
+@check_messages.before_loop
+async def before_messages():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
 
@@ -531,6 +586,7 @@ async def slash_commands(interaction: discord.Interaction):
     embed.add_field(name="/sprawdziany", value="Nadchodzące sprawdziany",          inline=False)
     embed.add_field(name="/nastepny",    value="Czas do następnego sprawdzianu",   inline=False)
     embed.add_field(name="/srednie",     value="Średnie ważone i oceny (owner only, prywatnie)", inline=False)
+    embed.add_field(name="/wiadomosci",  value="Ostatnie wiadomości z dziennika (owner only, prywatnie)", inline=False)
     embed.add_field(name="/setup",       value="Utwórz kanały plan-lekcji i sprawdziany", inline=False)
     embed.add_field(name="/info",        value="Status bota (owner only)",         inline=False)
     embed.add_field(name="/sync",        value="Force sync komend (owner only)",   inline=False)
@@ -660,6 +716,25 @@ async def slash_nastepny(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`")
+
+
+@bot.tree.command(name="wiadomosci", description="Ostatnie wiadomości z dziennika (tylko właściciel, widzisz tylko ty)")
+async def slash_wiadomosci(interaction: discord.Interaction, ile: int = 5):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Tylko właściciel może zobaczyć wiadomości.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        client   = get_client()
+        messages = await asyncio.to_thread(client.get_messages)
+        messages = sorted((m for m in messages if not m.get("Withdrawn")),
+                          key=lambda m: m.get("SentAt") or "", reverse=True)[:max(1, min(ile, 10))]
+        if not messages:
+            await interaction.followup.send("Skrzynka jest pusta.", ephemeral=True)
+            return
+        await interaction.followup.send(embeds=[message_embed(m, 5000 // len(messages) - 300) for m in messages], ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
 
 
 @bot.tree.command(name="srednie", description="Średnie ważone z bieżącego okresu (tylko właściciel, widzisz tylko ty)")
@@ -925,7 +1000,7 @@ async def on_ready():
     if daily_schedule.is_running():
         return
     for loop in (daily_schedule, check_exams, rotate_status, uptime_ping,
-                 calendar_sync_task, evening_reminder, check_grades):
+                 calendar_sync_task, evening_reminder, check_grades, check_messages):
         loop.start()
     asyncio.create_task(run_calendar_sync("startup"))
 

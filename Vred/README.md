@@ -17,6 +17,7 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
 - 🌙 **Evening reminder**: at `REMINDER_HOUR` (default 19:00) posts tomorrow's exams with topics and timetable changes; on Sundays also a preview of the week
 - ⚠️ **Busy days**: warns when two or more exams fall on the same day
 - 🎓 **Grade alerts**: DMs the owner about new or changed grades, with the subject average before → after
+- ✉️ **Message alerts**: DMs the owner every new eduVULCAN message (checked every `MESSAGES_INTERVAL` minutes); reading the list does not mark messages as read
 
 ## Available Commands
 - `/plan` — Lesson plan for today
@@ -25,6 +26,7 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
 - `/sprawdziany [tygodnie]` — Upcoming exams (default 2 weeks)
 - `/nastepny` — Time until the next exam
 - `/srednie` — Weighted averages for the current period (owner only, ephemeral)
+- `/wiadomosci [ile]` — Latest eduVULCAN messages (owner only, ephemeral, max 10)
 
 ### Owner Commands
 - `/info` — Bot status (owner only)
@@ -38,6 +40,7 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
    - `SCHEDULE_CHANNEL` — Channel name for schedule (default: `plan-lekcji`)
    - `EXAMS_CHANNEL` — Channel name for exam notifications (default: `sprawdziany`)
    - `CHECK_INTERVAL` — How often to check for new exams in minutes (default: `60`)
+   - `MESSAGES_INTERVAL` — How often to check for new messages in minutes (default: `15`)
 2. Install all required Python packages from `requirements.txt`:
    ```bash
    py -3.12 -m pip install -r requirements.txt -r requirements-register.txt

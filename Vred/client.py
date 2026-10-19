@@ -197,3 +197,12 @@ class VulcanClient:
             return self._get(url)["Envelope"]["Number"]
         except Exception:
             return None
+
+    def get_messages(self, kind: str = "received", page_size: int = 100) -> list:
+        """kind: received | sent | deleted. Odczyt listy NIE oznacza wiadomosci jako przeczytanej."""
+        box = self._pupil["MessageBox"]["GlobalKey"]
+        url = (
+            f"{self._rest_url}/{self._symbol()}/api/mobile/messages/{kind}/byBox"
+            f"?box={box}&lastId=-2147483648&pupilId={self._pupil_id()}&pageSize={page_size}"
+        )
+        return self._get(url)["Envelope"]

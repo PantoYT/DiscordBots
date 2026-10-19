@@ -5,6 +5,8 @@ Pure logic for Vred — no Discord, no network, so it can be selftested.
 """
 from __future__ import annotations
 
+import html
+import re
 from collections import defaultdict
 
 # --------------------------------------------------------------------------- #
@@ -155,6 +157,33 @@ def busy_days(exams, threshold: int = 2) -> dict[str, list]:
 
 
 # --------------------------------------------------------------------------- #
+# Messages — Content is HTML (p, br, strong, em, ul/li)
+# --------------------------------------------------------------------------- #
+
+def html_to_text(content: str) -> str:
+    """Message HTML -> Discord markdown."""
+    s = content or ""
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</p\s*>|</div\s*>|</ul\s*>|</ol\s*>", "\n\n", s)
+    s = re.sub(r"(?i)<li[^>]*>", "• ", s)
+    s = re.sub(r"(?i)</li\s*>", "\n", s)
+    s = re.sub(r"(?i)</?(strong|b)\b[^>]*>", "**", s)
+    s = re.sub(r"(?i)</?(em|i)\b[^>]*>", "*", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = html.unescape(s).replace("\xa0", " ")
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def new_messages(messages, seen: set[str]) -> list[dict]:
+    """Unseen, not withdrawn, oldest first."""
+    fresh = [m for m in messages
+             if str(m.get("Id")) not in seen and not m.get("Withdrawn")]
+    return sorted(fresh, key=lambda m: m.get("SentAt") or "")
+
+
+# --------------------------------------------------------------------------- #
 # Selftest
 # --------------------------------------------------------------------------- #
 
@@ -215,6 +244,15 @@ def selftest() -> int:
              {"DeadlineAt": "2026-10-01"}, {}]
     check(list(busy_days(exams)) == ["2026-10-02"], "busy days")
     check(list(exams_by_day(exams)) == ["2026-10-01", "2026-10-02"], "sorted by day")
+
+    t = html_to_text("<p>Dzień dobry,<br>jutro <strong>wycieczka</strong>&nbsp;&amp; zbiórka</p>"
+                     "<ul><li>plecak</li><li><em>woda</em></li></ul><p></p>")
+    check(t == "Dzień dobry,\njutro **wycieczka** & zbiórka\n\n• plecak\n• *woda*", repr(t))
+    check(html_to_text(None) == "", "empty content")
+
+    msgs = [{"Id": "b", "SentAt": "2026-10-19T12:00"}, {"Id": "a", "SentAt": "2026-10-01T08:00"},
+            {"Id": "c", "SentAt": "2026-10-02T08:00", "Withdrawn": True}, {"Id": "d", "SentAt": "2026-09-01"}]
+    check([m["Id"] for m in new_messages(msgs, {"d"})] == ["a", "b"], "new messages, withdrawn skipped")
 
     print(f"selftest OK — {checks} checks")
     return 0
