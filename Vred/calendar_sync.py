@@ -17,9 +17,10 @@ przedmioty z tego samego dnia nigdy nie dostają tego samego koloru (zero
 kolizji tam, gdzie realnie by przeszkadzały), a te co nigdy się nie
 spotykają mogą spokojnie dzielić kolor.
 
-Wymaga google_calendar_token.json (patrz calendar_auth.py). Token jest
-z aplikacji w trybie Testing — wygasa po ~7 dniach; wtedy ta funkcja rzuca
-CalendarAuthError, żeby wołający (main.py) mógł dać znać na Discordzie.
+Wymaga google_calendar_token.json (patrz calendar_auth.py). Aplikacja OAuth
+jest In production, więc token nie wygasa sam; gdy Google go odrzuci
+(odwołany dostęp, ~6 mies. bez użycia), ta funkcja rzuca CalendarAuthError,
+żeby wołający (main.py) mógł dać znać na Discordzie.
 
 Diffuje po Id lekcji z Hebe (trzymanym w extendedProperties.private) — nie
 tworzy duplikatów przy kolejnych synchronizacjach, aktualizuje zmienione

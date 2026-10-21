@@ -2,8 +2,8 @@
 Jednorazowa autoryzacja OAuth do Google Calendar (projekt "vred-calendar",
 konto testowe = własne). Zapisuje refresh_token do google_calendar_token.json.
 
-Ważne: to jest aplikacja w trybie Testing — Google wygasza refresh_token po
-7 dniach. Ten skrypt trzeba więc uruchamiać ponownie za każdym razem, gdy
+Aplikacja OAuth jest In production (niezweryfikowana, użytek osobisty), więc
+refresh_token nie wygasa sam. Skrypt odpala się ponownie tylko wtedy, gdy
 calendar_sync.py zgłosi invalid_grant (Vred da znać na Discordzie).
 
 Użycie:
@@ -112,7 +112,7 @@ def run():
             "token_uri": client["token_uri"],
         }, f, indent=2)
 
-    print(f"[calendar_auth] Zapisano {TOKEN_FILE}. Autoryzacja wazna ~7 dni (tryb Testing).")
+    print(f"[calendar_auth] Zapisano {TOKEN_FILE}.")
 
 
 if __name__ == "__main__":

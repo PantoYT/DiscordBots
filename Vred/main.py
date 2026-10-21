@@ -319,8 +319,8 @@ async def before_daily():
 
 async def run_calendar_sync(reason: str):
     """Blokujaca robota sieciowa calendar_sync.sync() w osobnym watku, zeby nie
-    zamrazac gateway'a Discorda. Przy wygasnieciu OAuth (Testing = ~7 dni)
-    wysyla DM do wlasciciela z instrukcja odnowienia."""
+    zamrazac gateway'a Discorda. Gdy Google odrzuci refresh_token (odwolany
+    dostep, ~6 mies. bez uzycia) wysyla DM do wlasciciela z instrukcja odnowienia."""
     global last_calendar_sync
     last_calendar_sync = datetime.now(CET).strftime("%Y-%m-%d")
     try:
@@ -331,11 +331,10 @@ async def run_calendar_sync(reason: str):
         try:
             owner = await bot.fetch_user(OWNER_ID)
             await owner.send(
-                "📅 Synchronizacja kalendarza Google wygasła.\n"
+                "📅 Google odrzucił token kalendarza — synchronizacja stoi.\n"
                 "Na PC w folderze Vred: `py -3.12 calendar_auth.py`, potem\n"
                 "`scp google_calendar_token.json ubuntu@100.117.148.97:~/vred/data/` "
-                "i `docker restart vred` na serwerze.\n"
-                "Żeby nie wracało co 7 dni: aplikacja OAuth w Google Cloud → *In production*."
+                "i `docker restart vred` na serwerze."
             )
         except Exception as dm_err:
             print(f"[calendar_sync:{reason}] nie udalo sie wyslac DM: {dm_err}")

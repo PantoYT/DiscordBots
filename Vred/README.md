@@ -77,10 +77,12 @@ docker compose up -d --build
 docker logs -f vred
 ```
 
-## Google Calendar sync and the 7-day login
-An OAuth app in **Testing** status gets refresh tokens that expire after 7 days.
-Switch the consent screen to **In production** (no verification needed for personal use —
-you will see an "unverified app" warning once) and run `calendar_auth.py` one more time.
+## Google Calendar sync and the OAuth login
+An OAuth app in **Testing** status gets refresh tokens that expire after 7 days, so the
+consent screen is set to **In production** (no verification needed for personal use —
+you will see an "unverified app" warning on consent). Tokens issued after that do not
+expire on their own; Vred sends the owner a DM only if Google rejects the token
+(revoked access, about six months unused), and then `calendar_auth.py` is run again.
 On a headless server, run `calendar_auth.py` on a machine with a browser and copy
 `google_calendar_token.json` into the data directory.
 
