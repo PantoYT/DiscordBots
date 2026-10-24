@@ -720,7 +720,7 @@ async def slash_commands(interaction: discord.Interaction):
     embed.add_field(name="/tydzien",     value="Plan lekcji na cały tydzień (poprzedni/obecny/następny)", inline=False)
     embed.add_field(name="/sprawdziany", value="Nadchodzące sprawdziany",          inline=False)
     embed.add_field(name="/nastepny",    value="Czas do następnego sprawdzianu",   inline=False)
-    embed.add_field(name="/srednie",     value="Średnie ważone i oceny; `cel:4` mówi, ile ocen poprawić (owner only, prywatnie)", inline=False)
+    embed.add_field(name="/srednie",     value="Średnie ważone i oceny; `cel:4.75` mówi, które oceny poprawić (owner only, prywatnie)", inline=False)
     embed.add_field(name="/powtorka",    value="Powtórka do najbliższego sprawdzianu (AI + źródła), opcjonalnie przedmiot", inline=False)
     embed.add_field(name="/szukaj",      value="Pytanie do AI z wyszukiwarką, odpowiedź ze źródłami", inline=False)
     embed.add_field(name="/zadania",     value="Zadania domowe na najbliższe dni", inline=False)
@@ -1056,16 +1056,31 @@ async def slash_wiadomosci(interaction: discord.Interaction, ile: int = 5):
 
 
 def raised_label(g: dict) -> str:
-    """'2' -> '2→3', '4+' -> '4+→5+', '5+' -> '5+→6' (one grade up, capped at 6)."""
+    """'2' -> '2→3', '4+' -> '4+→5+' (one grade up)."""
     content = (g.get("Content") or "?").strip()
     v = int(g.get("Value") or 0)
-    if v >= 5:
-        return f"{content}→6"
     return f"{content}→{v + 1}{content[-1] if content.endswith(('+', '-')) else ''}"
 
 
+def goal_text(plan: dict, cel: float) -> str:
+    if plan["current"] is None:
+        return "Brak ocen liczbowych."
+    head = f"Teraz **{plan['current']:.2f}** z {len(plan['finals'])} przewidywanych ocen końcowych."
+    if not plan["reachable"]:
+        return (f"{head}\n❌ {cel:g} nieosiągalne bez poprawiania na 6 — "
+                f"najwyżej **{plan['best']:.2f}**.")
+    if not plan["steps"]:
+        return f"{head}\n✅ Cel {cel:g} już osiągnięty."
+    fixes = sum(len(gs) for _, gs in plan["steps"].values())
+    word  = "ocenę" if fixes == 1 else "oceny" if fixes % 10 in (2, 3, 4) and fixes % 100 not in (12, 13, 14) else "ocen"
+    lines = [f"{head}\nDo **{cel:g}**: popraw **{fixes}** {word} o jedną w górę:"]
+    for s, (new_final, gs) in sorted(plan["steps"].items(), key=lambda x: len(x[1][1])):
+        lines.append(f"• {s} {plan['finals'][s]}→{new_final}: `{' '.join(raised_label(g) for g in gs)}`")
+    return "\n".join(lines)
+
+
 @bot.tree.command(name="srednie", description="Średnie ważone z bieżącego okresu (tylko właściciel, widzisz tylko ty)")
-@discord.app_commands.describe(cel="Docelowa ocena (np. 4 = średnia od 3.75) albo konkretna średnia (np. 4.5)")
+@discord.app_commands.describe(cel="Docelowa średnia ocen końcowych, np. 4.75 — powie, które oceny poprawić")
 async def slash_srednie(interaction: discord.Interaction,
                         cel: discord.app_commands.Range[float, 1.0, 6.0] | None = None):
     if interaction.user.id != OWNER_ID:
@@ -1086,6 +1101,7 @@ async def slash_srednie(interaction: discord.Interaction,
             by_subj.setdefault(s, []).append(g)
             position[s] = ((g.get("Column") or {}).get("Subject") or {}).get("Position", 999)
         entries = {(x.get("Subject") or {}).get("Name"): x for x in summary}
+        plan    = logic.overall_plan(by_subj, cel if cel is not None else 0)
 
         lines = []
         for s in sorted(by_subj, key=lambda s: (position[s], s)):
@@ -1094,25 +1110,19 @@ async def slash_srednie(interaction: discord.Interaction,
             e       = entries.get(s) or {}
             extra   = "".join(f" • {label} **{e[k]}**" for k, label in
                               (("Entry_1", "prop."), ("Entry_2", "końc.")) if e.get(k))
-            if cel is not None:
-                raise_ = logic.grades_to_raise(gs, logic.target_threshold(cel))
-                if raise_ is None:
-                    extra += " • ❌ cel nieosiągalny"
-                elif raise_:
-                    extra += f" • popraw {len(raise_)}: `{' '.join(raised_label(g) for g in raise_)}`"
-                else:
-                    extra += " • ✅"
-            lines.append(f"**{fmt_avg(logic.weighted_avg(gs))}** {s} — `{marks}`{extra}")
+            final   = f" ({plan['finals'][s]})" if s in plan["finals"] else ""
+            lines.append(f"**{fmt_avg(logic.weighted_avg(gs))}**{final} {s} — `{marks}`{extra}")
 
+        current = f" • końcowa ~{plan['current']:.2f}" if plan["current"] is not None else ""
         embed = discord.Embed(
-            title=f"📊 Średnie — ogólna {fmt_avg(logic.weighted_avg(grades))}",
+            title=f"📊 Średnie — ogólna {fmt_avg(logic.weighted_avg(grades))}{current}",
             description="\n".join(lines)[:4096],
             color=VRED_COLOR,
         )
-        goal = ""
         if cel is not None:
-            goal = f"cel {cel:g} = średnia ≥ {logic.target_threshold(cel):g}, poprawa o jedną ocenę w górę • "
-        embed.set_footer(text=f"{goal}+ = +{logic.PLUS_MOD}, − = {logic.MINUS_MOD} • {len(grades)} ocen • Vred")
+            embed.add_field(name=f"🎯 Cel {cel:g}", value=goal_text(plan, cel)[:1024], inline=False)
+        embed.set_footer(text=f"(x) = przewidywana końcowa, od x.75 w górę • + = +{logic.PLUS_MOD}, "
+                              f"− = {logic.MINUS_MOD} • {len(grades)} ocen • Vred")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`", ephemeral=True)

@@ -112,19 +112,31 @@ def weighted_avg(grades) -> float | None:
 
 
 ROUND_UP_FROM = 0.75   # x.75 rounds up to x+1, e.g. 3.75 -> 4
+RAISE_MAX = 5          # a fixed grade tops out at 5 (5+ at most); a 6 is not a realistic fix
 
 
-def target_threshold(cel: float) -> float:
-    """Average needed for target `cel`: a whole grade means its rounding threshold
-    (4 -> 3.75), anything else is taken as a literal average (4.5 -> 4.5)."""
-    return cel - (1 - ROUND_UP_FROM) if float(cel).is_integer() else cel
+def raw_avg(grades) -> float | None:
+    """weighted_avg without rounding, so 3.749 does not pass the 3.75 threshold."""
+    num = den = 0.0
+    for g in grades:
+        val, w = grade_points(g)
+        if val is not None:
+            num += val * w
+            den += w
+    return num / den if den else None
+
+
+def final_grade(avg: float) -> int:
+    """Predicted final grade: x.75 and above rounds up."""
+    whole = int(avg)
+    return min(6, whole + (1 if avg - whole >= ROUND_UP_FROM - 1e-9 else 0))
 
 
 def grades_to_raise(grades, threshold: float) -> list[dict] | None:
-    """Fewest grades to raise by one (capped at 6) so the weighted average reaches
-    `threshold`. [] when already there, None when even raising all is not enough.
-    Greedy on weight * gain is optimal: every grade can be raised once, so the
-    largest contributions reach the missing sum with the smallest count."""
+    """Fewest grades to raise by one step (only those below RAISE_MAX) so the weighted
+    average reaches `threshold`. [] when already there, None when out of reach.
+    Every raise adds exactly one point times the weight, so taking the heaviest
+    grades first gives the smallest count; on a tie the lowest grade goes first."""
     pts = [(g, *grade_points(g)) for g in grades]
     pts = [(g, v, w) for g, v, w in pts if v is not None]
     den = sum(w for _, _, w in pts)
@@ -132,16 +144,54 @@ def grades_to_raise(grades, threshold: float) -> list[dict] | None:
         return None
     missing = threshold * den - sum(v * w for _, v, w in pts) - 1e-9
     picked = []
-    # equal gain -> the lower grade first: a 3 is a likelier fix than a 5
-    for g, v, w in sorted(pts, key=lambda p: (-(min(p[1] + 1, 6) - p[1]) * p[2], p[1])):
+    for g, v, w in sorted(pts, key=lambda p: (-p[2], p[1])):
         if missing <= 0:
             break
-        gain = (min(v + 1, 6) - v) * w
-        if gain <= 0:
-            break
+        if int(g["Value"]) >= RAISE_MAX:
+            continue
         picked.append(g)
-        missing -= gain
+        missing -= w
     return picked if missing <= 0 else None
+
+
+def overall_plan(by_subject: dict[str, list], cel: float) -> dict:
+    """Cheapest way (fewest fixed grades) to lift the mean of predicted final grades
+    to `cel`. A subject may climb more than one final grade if that is cheaper.
+    Returns finals, current mean, steps {subject: (new_final, grades)} and
+    `best` (highest mean reachable) when the target is out of reach."""
+    finals = {s: final_grade(a) for s, gs in by_subject.items() if (a := raw_avg(gs)) is not None}
+    n = len(finals)
+    if not n:
+        return {"finals": {}, "current": None, "steps": {}, "reachable": False, "best": None}
+    total = sum(finals.values())
+    need = max(0, -int(-(cel * n - total - 1e-9) // 1))       # ceil
+    # options per subject: k bumps -> (cost, grades), k = 0 always free
+    options = {}
+    for s, f in finals.items():
+        opts = {0: (0, [])}
+        for k in range(1, 7 - f):
+            pick = grades_to_raise(by_subject[s], f + k - (1 - ROUND_UP_FROM))
+            if pick is None:
+                break
+            opts[k] = (len(pick), pick)
+        options[s] = opts
+    # knapsack: dp[b] = (cost, {subject: k}) for b bumps, b capped at `need`
+    dp = {0: (0, {})}
+    for s, opts in options.items():
+        nxt = dict(dp)
+        for b, (cost, chosen) in dp.items():
+            for k, (c, _) in opts.items():
+                if k == 0:
+                    continue
+                nb = min(need, b + k)
+                if nb not in nxt or cost + c < nxt[nb][0]:
+                    nxt[nb] = (cost + c, dict(chosen, **{s: k}))
+        dp = nxt
+    if need in dp:
+        steps = {s: (finals[s] + k, options[s][k][1]) for s, k in dp[need][1].items()}
+        return {"finals": finals, "current": total / n, "steps": steps, "reachable": True, "best": None}
+    best = total + sum(max(o) for o in options.values())
+    return {"finals": finals, "current": total / n, "steps": {}, "reachable": False, "best": best / n}
 
 
 def grade_subject(g: dict) -> str:
@@ -391,21 +441,29 @@ def selftest() -> int:
     check(weighted_avg([g(1, "3", 3.0, 1), g(2, "6", 6.0, 2)]) == 5.0, "weights")
     check(weighted_avg([g(1, "np", None), g(2, "+", 0.0)]) is None, "non-numeric ignored")
     check(weighted_avg([g(1, "5", 5.0, 0)]) is None, "zero weight ignored")
-    check(target_threshold(4) == 3.75 and target_threshold(4.5) == 4.5, "target threshold")
+    check(final_grade(3.75) == 4 and final_grade(3.74) == 3 and final_grade(5.9) == 6, "x.75 rounding")
+    check(raw_avg([g(1, "4", 4.0), g(2, "3", 3.0, 2)]) == 10 / 3, "raw avg")
     check(grades_to_raise([g(1, "4", 4.0)], 3.75) == [], "already there")
-    # 3,3,3 (w1) + 2 (w2): sum 13 / 5; the w2 grade alone gives 2 points
     two = g(4, "2", 2.0, 2)
     four = [g(1, "3", 3.0), g(2, "3", 3.0), g(3, "3", 3.0), two]
     check(grades_to_raise(four, 3.0) == [two], "heaviest first")
     check(len(grades_to_raise(four, 3.5)) == 4, "needs all four")
     check(grades_to_raise(four, 3.75) is None, "max gain 5 < 5.75 missing")
-    # 2,2 -> 2.75 reachable with one raise only if exact: 3+2=2.5, so both needed
-    check(len(grades_to_raise([g(1, "2", 2.0), g(2, "2", 2.0)], 2.75)) == 2, "two raises")
-    check(grades_to_raise([g(1, "1", 1.0), g(2, "1", 1.0)], 3.75) is None, "unreachable")
-    check(grades_to_raise([g(1, "6", 6.0), g(2, "5+", 5.0), g(3, "1", 1.0)], 5.5) is None, "6 cap")
-    check(grades_to_raise([g(1, "np", None)], 3.75) is None, "no numeric grades")
+    check(grades_to_raise([g(1, "5", 5.0), g(2, "5", 5.0)], 5.25) is None, "no raising to 6")
+    check(len(grades_to_raise([g(1, "4+", 4.0), g(2, "4", 4.0)], 4.75)) == 1, "4+ -> 5+ allowed")
     low = g(2, "3", 3.0)
-    check(grades_to_raise([g(1, "5", 5.0), low], 4.25) == [low], "lower grade on a tie")
+    check(grades_to_raise([g(1, "4", 4.0), low], 4.0) == [low], "lower grade on a tie")
+    check(grades_to_raise([g(1, "np", None)], 3.75) is None, "no numeric grades")
+
+    subj = {"A": [g(1, "5", 5.0)], "B": [g(2, "4", 4.0)],
+            "C": [g(3, "3", 3.0), g(4, "4", 4.0)], "D": [g(5, "4", 4.0), g(6, "4", 4.0)]}
+    plan = overall_plan(subj, 4.5)       # finals 5,4,3,4 = 4.0; needs two bumps
+    check(plan["finals"] == {"A": 5, "B": 4, "C": 3, "D": 4} and plan["current"] == 4.0, str(plan))
+    check(plan["reachable"] and sum(len(v[1]) for v in plan["steps"].values()) == 2, str(plan["steps"]))
+    check("C" in plan["steps"] and plan["steps"]["C"][0] == 4, "cheapest: one fix in C, one in B")
+    check(overall_plan(subj, 4.0)["steps"] == {}, "target met")
+    out = overall_plan(subj, 5.5)
+    check(not out["reachable"] and out["best"] == 4.75, str(out))  # A stays 5, C only to 4
     avgs = subject_averages([g(1, "5", 5.0), g(2, "3", 3.0, subj="Chemia")])
     check(avgs == {"Fizyka": 5.0, "Chemia": 3.0}, str(avgs))
 
