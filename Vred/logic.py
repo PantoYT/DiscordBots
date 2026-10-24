@@ -111,6 +111,39 @@ def weighted_avg(grades) -> float | None:
     return round(num / den, 2) if den else None
 
 
+ROUND_UP_FROM = 0.75   # x.75 rounds up to x+1, e.g. 3.75 -> 4
+
+
+def target_threshold(cel: float) -> float:
+    """Average needed for target `cel`: a whole grade means its rounding threshold
+    (4 -> 3.75), anything else is taken as a literal average (4.5 -> 4.5)."""
+    return cel - (1 - ROUND_UP_FROM) if float(cel).is_integer() else cel
+
+
+def grades_to_raise(grades, threshold: float) -> list[dict] | None:
+    """Fewest grades to raise by one (capped at 6) so the weighted average reaches
+    `threshold`. [] when already there, None when even raising all is not enough.
+    Greedy on weight * gain is optimal: every grade can be raised once, so the
+    largest contributions reach the missing sum with the smallest count."""
+    pts = [(g, *grade_points(g)) for g in grades]
+    pts = [(g, v, w) for g, v, w in pts if v is not None]
+    den = sum(w for _, _, w in pts)
+    if not den:
+        return None
+    missing = threshold * den - sum(v * w for _, v, w in pts) - 1e-9
+    picked = []
+    # equal gain -> the lower grade first: a 3 is a likelier fix than a 5
+    for g, v, w in sorted(pts, key=lambda p: (-(min(p[1] + 1, 6) - p[1]) * p[2], p[1])):
+        if missing <= 0:
+            break
+        gain = (min(v + 1, 6) - v) * w
+        if gain <= 0:
+            break
+        picked.append(g)
+        missing -= gain
+    return picked if missing <= 0 else None
+
+
 def grade_subject(g: dict) -> str:
     return ((g.get("Column") or {}).get("Subject") or {}).get("Name", "?")
 
@@ -358,6 +391,21 @@ def selftest() -> int:
     check(weighted_avg([g(1, "3", 3.0, 1), g(2, "6", 6.0, 2)]) == 5.0, "weights")
     check(weighted_avg([g(1, "np", None), g(2, "+", 0.0)]) is None, "non-numeric ignored")
     check(weighted_avg([g(1, "5", 5.0, 0)]) is None, "zero weight ignored")
+    check(target_threshold(4) == 3.75 and target_threshold(4.5) == 4.5, "target threshold")
+    check(grades_to_raise([g(1, "4", 4.0)], 3.75) == [], "already there")
+    # 3,3,3 (w1) + 2 (w2): sum 13 / 5; the w2 grade alone gives 2 points
+    two = g(4, "2", 2.0, 2)
+    four = [g(1, "3", 3.0), g(2, "3", 3.0), g(3, "3", 3.0), two]
+    check(grades_to_raise(four, 3.0) == [two], "heaviest first")
+    check(len(grades_to_raise(four, 3.5)) == 4, "needs all four")
+    check(grades_to_raise(four, 3.75) is None, "max gain 5 < 5.75 missing")
+    # 2,2 -> 2.75 reachable with one raise only if exact: 3+2=2.5, so both needed
+    check(len(grades_to_raise([g(1, "2", 2.0), g(2, "2", 2.0)], 2.75)) == 2, "two raises")
+    check(grades_to_raise([g(1, "1", 1.0), g(2, "1", 1.0)], 3.75) is None, "unreachable")
+    check(grades_to_raise([g(1, "6", 6.0), g(2, "5+", 5.0), g(3, "1", 1.0)], 5.5) is None, "6 cap")
+    check(grades_to_raise([g(1, "np", None)], 3.75) is None, "no numeric grades")
+    low = g(2, "3", 3.0)
+    check(grades_to_raise([g(1, "5", 5.0), low], 4.25) == [low], "lower grade on a tie")
     avgs = subject_averages([g(1, "5", 5.0), g(2, "3", 3.0, subj="Chemia")])
     check(avgs == {"Fizyka": 5.0, "Chemia": 3.0}, str(avgs))
 

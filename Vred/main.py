@@ -720,7 +720,7 @@ async def slash_commands(interaction: discord.Interaction):
     embed.add_field(name="/tydzien",     value="Plan lekcji na cały tydzień (poprzedni/obecny/następny)", inline=False)
     embed.add_field(name="/sprawdziany", value="Nadchodzące sprawdziany",          inline=False)
     embed.add_field(name="/nastepny",    value="Czas do następnego sprawdzianu",   inline=False)
-    embed.add_field(name="/srednie",     value="Średnie ważone i oceny (owner only, prywatnie)", inline=False)
+    embed.add_field(name="/srednie",     value="Średnie ważone i oceny; `cel:4` mówi, ile ocen poprawić (owner only, prywatnie)", inline=False)
     embed.add_field(name="/powtorka",    value="Powtórka do najbliższego sprawdzianu (AI + źródła), opcjonalnie przedmiot", inline=False)
     embed.add_field(name="/szukaj",      value="Pytanie do AI z wyszukiwarką, odpowiedź ze źródłami", inline=False)
     embed.add_field(name="/zadania",     value="Zadania domowe na najbliższe dni", inline=False)
@@ -1055,8 +1055,19 @@ async def slash_wiadomosci(interaction: discord.Interaction, ile: int = 5):
         await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
 
 
+def raised_label(g: dict) -> str:
+    """'2' -> '2→3', '4+' -> '4+→5+', '5+' -> '5+→6' (one grade up, capped at 6)."""
+    content = (g.get("Content") or "?").strip()
+    v = int(g.get("Value") or 0)
+    if v >= 5:
+        return f"{content}→6"
+    return f"{content}→{v + 1}{content[-1] if content.endswith(('+', '-')) else ''}"
+
+
 @bot.tree.command(name="srednie", description="Średnie ważone z bieżącego okresu (tylko właściciel, widzisz tylko ty)")
-async def slash_srednie(interaction: discord.Interaction):
+@discord.app_commands.describe(cel="Docelowa ocena (np. 4 = średnia od 3.75) albo konkretna średnia (np. 4.5)")
+async def slash_srednie(interaction: discord.Interaction,
+                        cel: discord.app_commands.Range[float, 1.0, 6.0] | None = None):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Tylko właściciel może zobaczyć oceny.", ephemeral=True)
         return
@@ -1083,6 +1094,14 @@ async def slash_srednie(interaction: discord.Interaction):
             e       = entries.get(s) or {}
             extra   = "".join(f" • {label} **{e[k]}**" for k, label in
                               (("Entry_1", "prop."), ("Entry_2", "końc.")) if e.get(k))
+            if cel is not None:
+                raise_ = logic.grades_to_raise(gs, logic.target_threshold(cel))
+                if raise_ is None:
+                    extra += " • ❌ cel nieosiągalny"
+                elif raise_:
+                    extra += f" • popraw {len(raise_)}: `{' '.join(raised_label(g) for g in raise_)}`"
+                else:
+                    extra += " • ✅"
             lines.append(f"**{fmt_avg(logic.weighted_avg(gs))}** {s} — `{marks}`{extra}")
 
         embed = discord.Embed(
@@ -1090,7 +1109,10 @@ async def slash_srednie(interaction: discord.Interaction):
             description="\n".join(lines)[:4096],
             color=VRED_COLOR,
         )
-        embed.set_footer(text=f"+ = +{logic.PLUS_MOD}, − = {logic.MINUS_MOD} • {len(grades)} ocen • Vred")
+        goal = ""
+        if cel is not None:
+            goal = f"cel {cel:g} = średnia ≥ {logic.target_threshold(cel):g}, poprawa o jedną ocenę w górę • "
+        embed.set_footer(text=f"{goal}+ = +{logic.PLUS_MOD}, − = {logic.MINUS_MOD} • {len(grades)} ocen • Vred")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
