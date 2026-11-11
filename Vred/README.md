@@ -29,6 +29,9 @@ stays in Polish, and AI answers default to Polish (`AI_LANGUAGE`) because the ex
 - 🧾 **Missed lessons**: topics of the lessons you missed, upcoming exams and homework in those subjects, and an AI catch-up on the topics
 - 🏁 **Proposed / final grades**: DMs the owner when a proposed or final grade appears or changes
 - 🌟 **Notes**: DMs the owner about new uwagi / pochwały
+- 🍀 **Lucky number**: with `LUCKY_NUMBER` set to your register number, a DM on the days it is drawn
+- 📬 **Weekly digest**: a DM at `WEEKLY_DIGEST` (default `fri 15:00`) with the week's grades and average changes, attendance, subjects on the edge, next week's exams and homework, and waiting quiz mistakes
+- 🗄️ **Topic archive**: every lesson topic is kept in `topics_archive.json` (first run backfills the current term), so `/find` keeps working after the register stops serving last year
 - 📆 **Google Calendar**: the timetable in a coloured `Lekcje` calendar, and exams plus homework as all-day events with reminders (18:00 the day before, and two days before an exam) in a separate `Exams & homework` calendar
 - 🧠 **AI study help** (optional, free): revision sheets, quizzes and answers from Groq (`openai/gpt-oss-120b`); revisions and answers search the web first and list their sources
 - ✉️ **Messages**: since November 2026 eduVULCAN serves register messages only to Premium accounts (`EDUVULCAN_PREMIUM`); Vred stops polling after the first such answer
@@ -45,6 +48,7 @@ stays in Polish, and AI answers default to Polish (`AI_LANGUAGE`) because the ex
 - `/ask <question>` — AI answer grounded in a web search, with sources
 - `/homework [days]` — Homework due in the next N days (default 14)
 - `/topics [offset]` — Lesson topics for a day (0 = today, -1 = yesterday)
+- `/find <query> [subject]` — Search every lesson topic of the year (diacritics ignored), newest first, with the date it first came up
 - `/missed [days]` — Lessons you missed in the last N days (default 14) with their topics, plus an AI catch-up button (owner only, ephemeral)
 - `/grades [target]` — Weighted averages for the current period plus the predicted final grade per subject (x.75 rounds up; owner only, ephemeral). With `target` (e.g. `4.75`) it targets the mean of final grades and lists the fewest grades to raise by one step, never to a 6, or says the target is out of reach
 - `/attendance` — Attendance in the current period, per subject (owner only, ephemeral)
@@ -74,6 +78,8 @@ search, about 2–3k tokens.
    - `AI_LANGUAGE` — language of AI answers (default: `Polish`)
    - `REMINDER_HOUR` / `MORNING_ALERT` — evening reminder hour (default `19`) and morning check `HH:MM` (default `06:30`, empty disables)
    - `QUIZ_QUESTIONS` — questions per quiz (default `8`)
+   - `LUCKY_NUMBER` — your number in the class register, for the lucky-number DM (optional)
+   - `WEEKLY_DIGEST` — day and time of the weekly digest DM (default `fri 15:00`, empty disables)
    - `GROQ_MODEL` / `GROQ_FALLBACK_MODEL` — defaults `openai/gpt-oss-120b` / `openai/gpt-oss-20b`; the free tier limits tokens per minute per model, so the fallback answers while the main one cools down
 2. Install all required Python packages from `requirements.txt`:
    ```bash

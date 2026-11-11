@@ -694,6 +694,65 @@ def study_plan(exams, start: str, days: int = 8) -> dict[str, list[tuple[str, di
     return {k: plan[k] for k in sorted(plan) if plan[k]}
 
 
+# --------------------------------------------------------------------------- #
+# Topic archive — every lesson topic kept locally, searchable after the API
+# stops serving last year's periods
+# --------------------------------------------------------------------------- #
+
+_PL = str.maketrans("łŁ", "lL")
+
+
+def fold(text: str) -> str:
+    """Lowercase without diacritics, so 'zarzadzanie' finds 'zarządzanie'."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", (text or "").translate(_PL))
+    return "".join(c for c in t if not unicodedata.combining(c)).lower()
+
+
+def archive_lessons(archive: dict, lessons) -> int:
+    """Merge lesson/byPupil entries into {lesson_id: [day, subject, teacher, topic]}.
+    Returns how many entries were added or changed. Lessons without a topic are skipped."""
+    changed = 0
+    for l in lessons:
+        topic = _topic(l)
+        if l.get("Id") is None or not topic:
+            continue
+        row = [l.get("DayAt") or "", ((l.get("Subject") or {}).get("Name") or "?").strip(),
+               ((l.get("TeacherPrimary") or {}).get("DisplayName") or "").strip(), topic]
+        if archive.get(str(l["Id"])) != row:
+            archive[str(l["Id"])] = row
+            changed += 1
+    return changed
+
+
+def find_topics(archive: dict, query: str, subject: str = "") -> list[list[str]]:
+    """Rows whose topic contains every word of the query (diacritics ignored),
+    optionally only in subjects containing `subject`; newest first."""
+    words, subj = fold(query).split(), fold(subject)
+    rows = [r for r in archive.values()
+            if all(w in fold(r[3]) for w in words) and (not subj or subj in fold(r[1]))]
+    return sorted(rows, key=lambda r: r[0], reverse=True)
+
+
+# --------------------------------------------------------------------------- #
+# Weekly digest — grades given since a day, with the average before and after
+# --------------------------------------------------------------------------- #
+
+def week_grades(grades, since: str) -> dict[str, dict]:
+    """{subject: {'new': [grade, ...], 'before': avg, 'after': avg}} for grades created since `since`."""
+    by_subj: dict[str, list] = defaultdict(list)
+    for g in grades:
+        by_subj[grade_subject(g)].append(g)
+    out = {}
+    for s, gs in by_subj.items():
+        new = [g for g in gs if (g.get("CreatedAt") or "")[:10] >= since]
+        if new:
+            out[s] = {"new": sorted(new, key=lambda g: g.get("CreatedAt") or ""),
+                      "before": weighted_avg([g for g in gs if g not in new]),
+                      "after": weighted_avg(gs)}
+    return dict(sorted(out.items()))
+
+
 def new_messages(messages, seen: set[str]) -> list[dict]:
     """Unseen, not withdrawn, oldest first."""
     fresh = [m for m in messages
@@ -963,6 +1022,30 @@ def selftest() -> int:
     check(any(d in ("2026-11-16", "2026-11-17") and kind == "first pass" and n == "C" for d, kind, n in flat),
           "first pass of C on the less loaded day")
     check(not any(n == "late" for _, _, n in flat), "outside the window")
+
+    # topic archive and search
+    check(fold("Zarządzanie bazą ŁÓDŹ") == "zarzadzanie baza lodz", fold("Zarządzanie bazą ŁÓDŹ"))
+    arch = {}
+    src = [{"Id": 1, "DayAt": "2026-10-05", "Topic": "Flexbox – kierunek i rozmieszczanie elementów.",
+            "Subject": {"Name": "strony  i aplikacje internetowe"}, "TeacherPrimary": {"DisplayName": "P W"}},
+           {"Id": 2, "DayAt": "2026-10-12", "Topic": "Budowa układu strony za pomocą Flexbox.",
+            "Subject": {"Name": "strony  i aplikacje internetowe"}, "TeacherPrimary": {"DisplayName": "P W"}},
+           {"Id": 3, "DayAt": "2026-10-13", "Topic": "Tworzenie układów (flexbox) w aplikacji",
+            "Subject": {"Name": "tworzenie aplikacji mobilnych"}, "TeacherPrimary": {"DisplayName": "P W"}},
+           {"Id": 4, "DayAt": "2026-10-14", "Topic": None, "Subject": {"Name": "x"}}]
+    check(archive_lessons(arch, src) == 3 and archive_lessons(arch, src) == 0, "archive adds once, skips no topic")
+    check(archive_lessons(arch, [dict(src[0], Topic="Flexbox – poprawiony temat")]) == 1, "changed topic updated")
+    hits = find_topics(arch, "FLEXBOX")
+    check([r[0] for r in hits] == ["2026-10-13", "2026-10-12", "2026-10-05"], "newest first, case-insensitive")
+    check(len(find_topics(arch, "budowa ukladu")) == 1, "all words, diacritics ignored")
+    check(len(find_topics(arch, "flexbox", "mobilnych")) == 1, "subject filter")
+
+    # weekly grades
+    wg = week_grades([{"Value": 3, "Content": "3", "CreatedAt": "2026-11-02T10:00:00", "Column": {"Weight": 1, "Subject": {"Name": "Fizyka"}}},
+                      {"Value": 5, "Content": "5", "CreatedAt": "2026-11-10T10:00:00", "Column": {"Weight": 1, "Subject": {"Name": "Fizyka"}}},
+                      {"Value": 4, "Content": "4", "CreatedAt": "2026-10-01T10:00:00", "Column": {"Weight": 1, "Subject": {"Name": "Chemia"}}}],
+                     "2026-11-09")
+    check(list(wg) == ["Fizyka"] and wg["Fizyka"]["before"] == 3.0 and wg["Fizyka"]["after"] == 4.0, str(wg))
 
     print(f"selftest OK — {checks} checks")
     return 0

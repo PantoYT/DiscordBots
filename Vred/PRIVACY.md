@@ -16,7 +16,8 @@ What Vred reads from eduVULCAN:
 Where that data goes:
 - Timetable, exams, homework and lesson topics are posted to the configured channels of the Discord
   server Vred is in, so every member of that server can see them.
-- Grades, attendance, notes and messages are private: they are sent only as
+- Grades, attendance, notes, messages, the lucky-number ping and the weekly
+  digest are private: they are sent only as
   direct messages to the bot owner, and the /grades, /attendance, /missed and
   /messages commands work only for the owner and reply ephemerally. Messages can contain personal data of teachers
   and other people (names, school matters); keep the owner's DMs private.
@@ -46,7 +47,8 @@ What Vred stores on the host machine:
   reminder_state.json (also tomorrow's timetable snapshot for the morning
   alert), schedule_message.json, grade_edges.json (subjects close to a
   final-grade threshold), quiz_state.json (quiz questions, answers and
-  mistakes, removed after the exam date).
+  mistakes, removed after the exam date), topics_archive.json (date, subject,
+  teacher and topic of every lesson since the first run — no attendance).
 - Discord user IDs are used only to answer commands and check the owner.
 
 These files never leave the host and are never committed to the repository.

@@ -42,6 +42,7 @@ SEEN_MESSAGES_FILE = DATA_DIR / "seen_messages.json"
 SEEN_SCHOOL_FILE  = DATA_DIR / "seen_school.json"
 GRADE_EDGES_FILE  = DATA_DIR / "grade_edges.json"
 QUIZ_FILE         = DATA_DIR / "quiz_state.json"
+TOPICS_FILE       = DATA_DIR / "topics_archive.json"
 MESSAGES_INTERVAL = int(os.getenv("MESSAGES_INTERVAL", 15))
 DAILY_HOUR        = int(os.getenv("DAILY_HOUR", 7))
 REMINDER_HOUR     = int(os.getenv("REMINDER_HOUR", 19))
@@ -50,6 +51,10 @@ CALENDAR_SYNC_HOUR = int(os.getenv("CALENDAR_SYNC_HOUR", 20))
 # empty disables the morning alert.
 MORNING_ALERT     = os.getenv("MORNING_ALERT", "06:30")
 QUIZ_QUESTIONS    = int(os.getenv("QUIZ_QUESTIONS", 8))
+# Your number in the class register — a DM when it is the lucky number of the day.
+LUCKY_NUMBER      = int(os.getenv("LUCKY_NUMBER") or 0) or None
+# "fri 15:00" — weekly digest DM; empty disables.
+WEEKLY_DIGEST     = os.getenv("WEEKLY_DIGEST", "fri 15:00")
 UPTIME_KUMA_URL   = os.getenv("UPTIME_KUMA_URL", "")
 last_schedule_run: str | None = None
 last_calendar_sync: str | None = None
@@ -552,6 +557,119 @@ async def before_morning():
 
 
 # ---------------------------------------------------------------------------
+# Lucky number — a DM when it is yours (no questioning today)
+# ---------------------------------------------------------------------------
+
+@tasks.loop(minutes=10)
+async def lucky_check():
+    now   = datetime.now(CET)
+    today = today_str(now)
+    if not LUCKY_NUMBER or not (6 <= now.hour < 16):
+        return
+    state = load_json(REMINDER_FILE, {})
+    if state.get("lucky") == today:
+        return
+    try:
+        n = await asyncio.to_thread(get_client().get_lucky_number)
+        if n is None:            # not drawn yet, weekend or holiday — try again later
+            return
+        if int(n) == LUCKY_NUMBER:
+            owner = await bot.fetch_user(OWNER_ID)
+            await owner.send(embed=discord.Embed(
+                title=f"🍀 Lucky number today: {n} — that's you",
+                description="You should not be questioned today.", color=0x3FB950).set_footer(text="Vred"))
+        state["lucky"] = today
+        save_json(REMINDER_FILE, state)
+    except Exception as e:
+        print(f"[lucky_check] {e}")
+
+
+@lucky_check.before_loop
+async def before_lucky():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
+# Weekly digest — a DM on Friday afternoon (grades are private)
+# ---------------------------------------------------------------------------
+
+def digest_due(now: datetime) -> bool:
+    if not WEEKLY_DIGEST:
+        return False
+    day, hm = WEEKLY_DIGEST.lower().split()
+    h, m = (int(x) for x in hm.split(":"))
+    return WEEKDAYS[now.weekday()][:3].lower() == day[:3] and (now.hour, now.minute) >= (h, m)
+
+
+async def build_digest(now: datetime) -> discord.Embed:
+    client = get_client()
+    monday = now - timedelta(days=now.weekday())
+    mon_s  = monday.strftime("%Y-%m-%d")
+    nxt_lo = monday + timedelta(days=7)
+    nxt_hi = monday + timedelta(days=13)
+    grades   = await asyncio.to_thread(client.get_grades)
+    lessons  = await asyncio.to_thread(client.get_attendance, monday, now)
+    exams    = await asyncio.to_thread(client.get_exams, nxt_lo, nxt_hi)
+    homework = await asyncio.to_thread(client.get_homework, nxt_lo, nxt_hi)
+
+    embed = discord.Embed(title=f"📬 Week {monday.strftime('%d.%m')}–{now.strftime('%d.%m')}", color=VRED_COLOR)
+    wg = logic.week_grades(grades, mon_s)
+    embed.add_field(name=f"🎓 Grades ({sum(len(v['new']) for v in wg.values())})", inline=False, value="\n".join(
+        f"**{s}**: {', '.join(g.get('Content') or '?' for g in v['new'])} — "
+        f"avg {fmt_avg(v['before'])} → **{fmt_avg(v['after'])}**" for s, v in wg.items())[:1024] or "No new grades.")
+
+    stats = logic.attendance_stats(lessons).get("", (0, 0))
+    issues = [l for l in lessons if logic.presence_issue(l)]
+    value = f"{stats[0]}/{stats[1]} present" if stats[1] else "No attendance entered yet."
+    if issues:
+        value += "\n" + "\n".join(f"`{fmt_short(l.get('DayAt') or '')}` {(l.get('Subject') or {}).get('Name', '?')}: "
+                                  f"{presence_label(l)}" for l in issues[:10])
+    embed.add_field(name="🚸 Attendance", value=value[:1024], inline=False)
+
+    edges = logic.grade_edges(by_subject(grades))
+    if edges:
+        embed.add_field(name="📉📈 On the edge", inline=False, value="\n".join(
+            f"{'📉' if st.startswith('drop') else '📈'} {s} ({fmt_avg(logic.raw_avg(by_subject(grades)[s]))})"
+            for s, st in edges.items())[:1024])
+
+    exams = sorted(exams, key=lambda e: exam_date(e) or "")
+    embed.add_field(name=f"📝 Next week's exams ({len(exams)})", inline=False, value="\n".join(
+        f"**{fmt_short(exam_date(e))}** {exam_label(e)} — {' '.join((e.get('Content') or '').split())[:100]}"
+        for e in exams)[:1024] or "None so far.")
+    if homework:
+        embed.add_field(name=f"📚 Next week's homework ({len(homework)})", inline=False, value="\n".join(
+            f"**{fmt_short(h.get('DeadlineAt') or '')}** {homework_line(h)}" for h in homework[:8])[:1024])
+    mistakes = sum(len(m["questions"]) for m in quiz_load()["mistakes"].values())
+    if mistakes:
+        embed.add_field(name="🧩 Quiz", value=f"{mistakes} saved mistakes waiting before upcoming exams.", inline=False)
+    embed.set_footer(text="Vred • weekly digest")
+    return embed
+
+
+@tasks.loop(minutes=1)
+async def weekly_digest():
+    now   = datetime.now(CET)
+    today = today_str(now)
+    if not digest_due(now):
+        return
+    state = load_json(REMINDER_FILE, {})
+    if state.get("digest") == today:
+        return
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+        await owner.send(embed=await build_digest(now))
+        state["digest"] = today
+        save_json(REMINDER_FILE, state)
+    except Exception as e:
+        print(f"[weekly_digest] {e}")
+
+
+@weekly_digest.before_loop
+async def before_digest():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
 # Grades — DM to the owner (grades are private, never in a channel)
 # ---------------------------------------------------------------------------
 
@@ -832,6 +950,56 @@ async def check_school():
 
 @check_school.before_loop
 async def before_school():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
+# Topic archive — kept locally so /find works across terms and school years
+# ---------------------------------------------------------------------------
+# lesson/byPupil only serves the periods the register still lists; at the start
+# of a new school year last year's topics disappear from the API. The archive
+# never forgets them. First run backfills each current period from its start.
+
+ARCHIVE_CHUNK_DAYS = 30
+
+
+def topics_load() -> dict:
+    st = load_json(TOPICS_FILE, {})
+    st.setdefault("lessons", {})
+    st.setdefault("backfilled", [])
+    return st
+
+
+@tasks.loop(hours=6)
+async def archive_topics():
+    try:
+        client = get_client()
+        st  = topics_load()
+        now = datetime.now(CET)
+        added = 0
+        for p in client.periods:
+            pid = str(p.get("Id"))
+            start = p.get("StartAt") or (p.get("Start") or {}).get("Date")
+            if pid in st["backfilled"] or not start:
+                continue
+            cursor = CET.localize(datetime.strptime(start, "%Y-%m-%d"))
+            while cursor <= now:
+                end = min(cursor + timedelta(days=ARCHIVE_CHUNK_DAYS - 1), now)
+                added += logic.archive_lessons(st["lessons"], await asyncio.to_thread(client.get_attendance, cursor, end))
+                cursor = end + timedelta(days=1)
+            st["backfilled"].append(pid)
+        # regular run: the last two weeks catch late-entered topics and edits
+        added += logic.archive_lessons(st["lessons"],
+                                       await asyncio.to_thread(client.get_attendance, now - timedelta(days=14), now))
+        save_json(TOPICS_FILE, st)
+        if added:
+            print(f"[archive_topics] {added} topics added or updated, {len(st['lessons'])} in total")
+    except Exception as e:
+        print(f"[archive_topics] {e}")
+
+
+@archive_topics.before_loop
+async def before_archive():
     await bot.wait_until_ready()
 
 
@@ -1220,7 +1388,7 @@ async def missed_report(since: str, until: str) -> tuple[discord.Embed, list]:
     embed.description = "\n".join(f"{k} ×{n}" if n > 1 else k for k, n in lines.items())[:4000]
     if ex:
         embed.add_field(name="Upcoming exams in these subjects", inline=False, value="\n".join(
-            f"**{fmt_short(exam_date(e))}** {exam_label(e)} — {(e.get('Content') or '').strip()[:120]}"
+            f"**{fmt_short(exam_date(e))}** {exam_label(e)} — {' '.join((e.get('Content') or '').split())[:120]}"
             for e in ex[:8])[:1024])
     if hw:
         embed.add_field(name="Homework in these subjects", inline=False, value="\n".join(
@@ -1326,6 +1494,7 @@ HELP = [
     ("/ask",        "Question for the AI with web search, answer with sources"),
     ("/homework",   "Homework for the coming days"),
     ("/topics",     "Lesson topics of a day (0 = today, -1 = yesterday)"),
+    ("/find",       "Search every lesson topic of the year, e.g. `flexbox` — when and in which subject"),
     ("/missed",     "Lessons you missed: topics, upcoming exams and homework, AI catch-up (owner, private)"),
     ("/grades",     "Weighted averages; `target:4.75` says which grades to fix (owner, private)"),
     ("/attendance", "Attendance this term (owner, private)"),
@@ -1538,7 +1707,29 @@ async def slash_topics(interaction: discord.Interaction, offset: int = 0):
         await interaction.followup.send(fail(e))
 
 
-@bot.tree.command(name="missed", description="Lessons you missed, with topics and what is coming up (owner, private)")
+@bot.tree.command(name="find", description="Search every lesson topic of the year")
+@discord.app_commands.describe(query="Words to find in topics, e.g. flexbox", subject="Only subjects containing this")
+async def slash_find(interaction: discord.Interaction, query: str, subject: str = ""):
+    await interaction.response.defer()
+    try:
+        st = topics_load()
+        if not st["lessons"]:
+            await interaction.followup.send("The topic archive is still being built — try in a minute.")
+            return
+        hits = logic.find_topics(st["lessons"], query, subject)
+        title = f"🔍 “{query}”" + (f" in {subject}" if subject else "") + f" — {len(hits)} lesson{'s' if len(hits) != 1 else ''}"
+        embed = discord.Embed(title=title[:256], color=VRED_COLOR)
+        lines = [f"`{fmt_short(d)}` **{subj}** — {topic}" for d, subj, _, topic in hits[:30]]
+        embed.description = "\n".join(lines)[:4000] if lines else "No topic matches."
+        if hits:
+            first = min(h[0] for h in hits)
+            embed.set_footer(text=f"First on {fmt_date(first)} • {len(st['lessons'])} topics archived • Vred")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(fail(e))
+
+
+@bot.tree.command(name="missed",description="Lessons you missed, with topics and what is coming up (owner, private)")
 @discord.app_commands.describe(days="How many days back (14 by default)")
 async def slash_missed(interaction: discord.Interaction, days: discord.app_commands.Range[int, 1, 120] = 14):
     if not await owner_only(interaction, "missed lessons"):
@@ -1877,7 +2068,8 @@ async def on_ready():
     if daily_schedule.is_running():
         return
     for loop in (daily_schedule, check_exams, rotate_status, uptime_ping, calendar_sync_task,
-                 evening_reminder, morning_alert, check_grades, check_messages, check_school):
+                 evening_reminder, morning_alert, check_grades, check_messages, check_school,
+                 lucky_check, weekly_digest, archive_topics):
         loop.start()
     asyncio.create_task(run_calendar_sync("startup"))
 
