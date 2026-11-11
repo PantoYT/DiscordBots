@@ -272,6 +272,65 @@ def sync() -> dict:
     return {"created": created, "updated": updated, "deleted": deleted, "unchanged": unchanged, "total": len(seen_ids)}
 
 
+TASKS_CALENDAR = "Exams & homework"
+TASKS_BACK_DAYS = 7
+TASKS_AHEAD_DAYS = 70
+
+
+def sync_tasks() -> dict:
+    """Exams and homework as all-day events with reminders, in their own calendar
+    (own source tag, so the lesson diff above never sees or deletes them).
+    Only events inside the fetched window are deleted — past exams that fall out
+    of the window stay in the calendar as history."""
+    import logic
+
+    gcal = GCal(_access_token())
+    calendar_id = gcal.find_or_create_calendar(TASKS_CALENDAR)
+    existing = {}
+    page_token = None
+    while True:
+        params = {"privateExtendedProperty": f"vulcanscope_source={logic.TASKS_SOURCE}",
+                  "maxResults": 2500, "singleEvents": "true"}
+        if page_token:
+            params["pageToken"] = page_token
+        data = gcal._req("GET", f"/calendars/{calendar_id}/events", params=params)
+        for ev in data.get("items", []):
+            tid = ev.get("extendedProperties", {}).get("private", {}).get("vulcanscope_id")
+            if tid:
+                existing[tid] = ev
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    vc = VulcanClient(str(DATA_DIR / "credentials.json"))
+    from datetime import datetime
+    now = datetime.now()
+    lo, hi = now - timedelta(days=TASKS_BACK_DAYS), now + timedelta(days=TASKS_AHEAD_DAYS)
+    bodies = logic.task_events(vc.get_exams(lo, hi), vc.get_homework(lo, hi))
+
+    created = updated = unchanged = 0
+    wanted = set()
+    for body in bodies:
+        tid = body["extendedProperties"]["private"]["vulcanscope_id"]
+        wanted.add(tid)
+        prev = existing.get(tid)
+        if prev is None:
+            gcal.insert_event(calendar_id, body)
+            created += 1
+        elif logic.task_event_changed(prev, body):
+            gcal.update_event(calendar_id, prev["id"], body)
+            updated += 1
+        else:
+            unchanged += 1
+    deleted = 0
+    for tid, ev in existing.items():
+        d = (ev.get("start") or {}).get("date") or ""
+        if tid not in wanted and lo.strftime("%Y-%m-%d") <= d <= hi.strftime("%Y-%m-%d"):
+            gcal.delete_event(calendar_id, ev["id"])
+            deleted += 1
+    return {"created": created, "updated": updated, "deleted": deleted, "unchanged": unchanged}
+
+
 if __name__ == "__main__":
     for _stream in (sys.stdout, sys.stderr):
         try:

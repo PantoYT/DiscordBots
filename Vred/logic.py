@@ -269,11 +269,11 @@ def new_by_id(items, seen: set[str]) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 def presence_issue(l: dict) -> str | None:
-    """'nieobecność' / 'spóźnienie' style label when the entry needs attention."""
+    """The register's own label (Polish, e.g. 'nieobecność') when the entry needs attention."""
     p = l.get("PresenceType") or {}
     if p.get("Removed") or not (p.get("Absence") or p.get("Late")):
         return None
-    return p.get("Name") or ("spóźnienie" if p.get("Late") else "nieobecność")
+    return p.get("Name") or ("late" if p.get("Late") else "absence")
 
 
 def attendance_changes(lessons, seen: dict[str, int]) -> list[dict]:
@@ -311,11 +311,11 @@ def attendance_stats(lessons) -> dict[str, tuple[int, int]]:
 # --------------------------------------------------------------------------- #
 
 def summary_changes(summary, seen: dict[str, list]) -> list[tuple[dict, str, str]]:
-    """[(entry, 'proponowana'|'końcowa', value)] for entries that appeared or changed."""
+    """[(entry, 'proposed'|'final', value)] for entries that appeared or changed."""
     out = []
     for s in summary:
         old = seen.get(str(s.get("Id"))) or [None, None]
-        for i, (key, label) in enumerate((("Entry_1", "proponowana"), ("Entry_2", "końcowa"))):
+        for i, (key, label) in enumerate((("Entry_1", "proposed"), ("Entry_2", "final"))):
             val = s.get(key)
             if val and val != old[i]:
                 out.append((s, label, val))
@@ -471,14 +471,227 @@ def context_prompt(ctx: dict) -> str:
 
     parts = []
     if ctx["own"]:
-        head = "Tematy lekcji z dziennika"
-        head += " od ostatniego sprawdzianu" if ctx["since"] else ""
-        parts.append(head + " (od najstarszych):\n" + "\n".join(line(l) for l in ctx["own"]))
+        head = "Lesson topics from the school register"
+        head += " since the last test" if ctx["since"] else ""
+        parts.append(head + " (oldest first):\n" + "\n".join(line(l) for l in ctx["own"]))
     if ctx["other"]:
-        parts.append("Tematy tego samego nauczyciela z innych przedmiotów (bywają przemieszane "
-                     "— użyj tylko tych, które pasują do zakresu):\n"
+        parts.append("Topics the same teacher gave in other subjects (they get mixed — "
+                     "use only the ones that fit the scope):\n"
                      + "\n".join(line(l, True) for l in ctx["other"]))
     return "\n\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Missed lessons — absences plus what is coming up in those subjects
+# --------------------------------------------------------------------------- #
+
+def _pos(l: dict) -> int:
+    return (l.get("TimeSlot") or {}).get("Position") or l.get("LessonNumber") or 0
+
+
+def missed_lessons(lessons, since: str = "", until: str = "9999") -> list[dict]:
+    """Absences (not lateness) between since and until, inclusive, in order."""
+    out = [l for l in lessons
+           if (p := l.get("PresenceType") or {}).get("Absence") and not p.get("Removed")
+           and since <= (l.get("DayAt") or "") <= until]
+    return sorted(out, key=lambda l: (l.get("DayAt") or "", _pos(l)))
+
+
+def missed_followups(missed, exams, homework, today: str) -> tuple[list, list]:
+    """Upcoming exams and homework in the subjects that were missed."""
+    subjects = {(l.get("Subject") or {}).get("Id") for l in missed}
+    ex = sorted((e for e in exams if (e.get("Subject") or {}).get("Id") in subjects
+                 and exam_date(e) >= today), key=exam_date)
+    hw = sorted((h for h in homework if (h.get("Subject") or {}).get("Id") in subjects
+                 and (h.get("DeadlineAt") or "")[:10] >= today), key=lambda h: h.get("DeadlineAt") or "")
+    return ex, hw
+
+
+# --------------------------------------------------------------------------- #
+# Quiz — model output -> validated questions with shuffled options
+# --------------------------------------------------------------------------- #
+# gpt-oss puts the right answer first almost every time (seen 2026-11-11), so
+# the options are shuffled here, deterministically per quiz.
+
+LETTERS = "ABCD"
+
+
+def parse_quiz(data, seed: str) -> list[dict]:
+    import random
+    out = []
+    for i, q in enumerate((data or {}).get("questions") or []):
+        if not isinstance(q, dict):
+            continue
+        text, opts, ans = q.get("q"), q.get("options"), q.get("answer")
+        if not (isinstance(text, str) and text.strip() and isinstance(opts, list) and len(opts) == 4
+                and all(isinstance(o, str) and o.strip() for o in opts)
+                and len({o.strip().lower() for o in opts}) == 4
+                and isinstance(ans, int) and not isinstance(ans, bool) and 0 <= ans < 4):
+            continue
+        order = list(range(4))
+        random.Random(f"{seed}:{i}").shuffle(order)
+        out.append({"q": text.strip()[:250], "options": [opts[k].strip()[:80] for k in order],
+                    "answer": order.index(ans), "why": str(q.get("why") or "").strip()[:400]})
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Grades on the edge — close to dropping or reaching the next final grade
+# --------------------------------------------------------------------------- #
+
+EDGE = 0.15
+
+
+def grade_edges(by_subject: dict[str, list], edge: float = EDGE) -> dict[str, str]:
+    """{subject: 'drop:F' | 'rise:F'} for subjects within `edge` of a final-grade
+    threshold (F = current predicted final). Subjects not on an edge are left out."""
+    out = {}
+    for s, gs in by_subject.items():
+        a = raw_avg(gs)
+        if a is None:
+            continue
+        f = final_grade(a)
+        if f >= 2 and a - (f - 1 + ROUND_UP_FROM) < edge:
+            out[s] = f"drop:{f}"
+        elif f <= 5 and (f + ROUND_UP_FROM) - a < edge:
+            out[s] = f"rise:{f}"
+    return out
+
+
+def edge_alerts(edges: dict[str, str], seen: dict[str, str]) -> list[tuple[str, str]]:
+    """Edges that are new since the last check (each state alerts once)."""
+    return sorted((s, st) for s, st in edges.items() if seen.get(s) != st)
+
+
+# --------------------------------------------------------------------------- #
+# Timetable snapshot — what changed between the evening reminder and morning
+# --------------------------------------------------------------------------- #
+
+def plan_signature(lessons, day: str) -> dict[str, str]:
+    """{position: 'Subject (room 12) change'} for one day's timetable."""
+    sig: dict[str, list[str]] = defaultdict(list)
+    for l in lessons:
+        if (l.get("DateAt") or (l.get("Date") or {}).get("Date")) != day:
+            continue
+        v = lesson_view(l)
+        room = f" (room {v['room']})" if v["room"] else ""
+        change = change_text(v)
+        sig[str(v["pos"])].append(f"{v['subject']}{room}{' ' + change if change else ''}")
+    return {k: " / ".join(sorted(v)) for k, v in sig.items()}
+
+
+def plan_diff(old: dict[str, str], new: dict[str, str]) -> list[str]:
+    lines = []
+    for pos in sorted(set(old) | set(new), key=lambda p: int(p) if p.lstrip("-").isdigit() else 99):
+        a, b = old.get(pos), new.get(pos)
+        if a == b:
+            continue
+        if b is None:
+            lines.append(f"`{pos}.` ~~{a}~~ — no longer in the plan")
+        elif a is None:
+            lines.append(f"`{pos}.` **{b}** — added")
+        else:
+            lines.append(f"`{pos}.` {a} → **{b}**")
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# Exam changes — moved date or rewritten scope of an exam already announced
+# --------------------------------------------------------------------------- #
+
+def exam_state(exams) -> dict[str, list]:
+    return {str(e.get("Id")): [exam_date(e), (e.get("Content") or "").strip()] for e in exams}
+
+
+def exam_changes(exams, seen: dict) -> list[tuple[dict, str, str]]:
+    """[(exam, old_date, old_content)] for announced exams whose date or scope changed.
+    seen[id] = None means 'announced before we stored details' — never an alert."""
+    out = []
+    for e in exams:
+        old = seen.get(str(e.get("Id")))
+        if isinstance(old, list) and old != [exam_date(e), (e.get("Content") or "").strip()]:
+            out.append((e, old[0], old[1]))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Calendar — exams and homework as all-day events with reminders
+# --------------------------------------------------------------------------- #
+
+TASKS_SOURCE = "vred-tasks"
+REMIND_DAY_BEFORE = 6 * 60          # all-day events start at 00:00 -> 18:00 the day before
+REMIND_TWO_DAYS = 30 * 60           # 18:00 two days before
+
+
+def _next_day(d: str) -> str:
+    from datetime import date, timedelta
+    return (date.fromisoformat(d) + timedelta(days=1)).isoformat()
+
+
+def task_events(exams, homework) -> list[dict]:
+    out = []
+    for e in exams:
+        d = exam_date(e)
+        if not d or e.get("Id") is None:
+            continue
+        subject = (e.get("Subject") or {}).get("Name", "?").strip()
+        out.append({
+            "summary": f"{e.get('Type') or 'Sprawdzian'}: {subject}",
+            "description": (e.get("Content") or "").strip(),
+            "start": {"date": d}, "end": {"date": _next_day(d)},
+            "colorId": "11",
+            "reminders": {"useDefault": False, "overrides": [
+                {"method": "popup", "minutes": REMIND_DAY_BEFORE},
+                {"method": "popup", "minutes": REMIND_TWO_DAYS}]},
+            "extendedProperties": {"private": {"vulcanscope_id": f"exam:{e['Id']}",
+                                               "vulcanscope_source": TASKS_SOURCE}},
+        })
+    for h in homework:
+        d = (h.get("DeadlineAt") or "")[:10]
+        if not d or h.get("Id") is None:
+            continue
+        subject = (h.get("Subject") or {}).get("Name", "?").strip()
+        out.append({
+            "summary": f"Homework: {subject}",
+            "description": html_to_text(h.get("Content"))[:2000],
+            "start": {"date": d}, "end": {"date": _next_day(d)},
+            "colorId": "5",
+            "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": REMIND_DAY_BEFORE}]},
+            "extendedProperties": {"private": {"vulcanscope_id": f"hw:{h['Id']}",
+                                               "vulcanscope_source": TASKS_SOURCE}},
+        })
+    return out
+
+
+def task_event_changed(prev: dict, body: dict) -> bool:
+    return (prev.get("summary") != body["summary"]
+            or (prev.get("description") or "") != body["description"]
+            or (prev.get("start") or {}).get("date") != body["start"]["date"]
+            or prev.get("colorId") != body["colorId"])
+
+
+# --------------------------------------------------------------------------- #
+# Heavy week — spread the revision over the days before each exam
+# --------------------------------------------------------------------------- #
+
+HEAVY_WEEK = 3
+
+
+def study_plan(exams, start: str, days: int = 8) -> dict[str, list[tuple[str, dict]]]:
+    """{day: [('first pass' | 'final review', exam)]} for exams in [start, start+days).
+    Final review the day before; first pass on the least loaded of the 2-3 days before."""
+    from datetime import date, timedelta
+    d0 = date.fromisoformat(start)
+    end = (d0 + timedelta(days=days)).isoformat()
+    plan: dict[str, list] = defaultdict(list)
+    for e in sorted((e for e in exams if start < exam_date(e) < end), key=exam_date):
+        d = date.fromisoformat(exam_date(e))
+        plan[(d - timedelta(days=1)).isoformat()].append(("final review", e))
+        cands = [(d - timedelta(days=k)).isoformat() for k in (3, 2) if d - timedelta(days=k) >= d0]
+        if cands:
+            day = min(cands, key=lambda c: (len(plan[c]), c))
+            plan[day].append(("first pass", e))
+    return {k: plan[k] for k in sorted(plan) if plan[k]}
 
 
 def new_messages(messages, seen: set[str]) -> list[dict]:
@@ -603,10 +816,10 @@ def selftest() -> int:
     check([l["Id"] for l in ch] == [2], "only new absence flagged")
 
     summ = [{"Id": 9, "Entry_1": "4", "Entry_2": None}, {"Id": 8, "Entry_1": None, "Entry_2": None}]
-    check(summary_changes(summ, {}) == [(summ[0], "proponowana", "4")], "proposed appears")
+    check(summary_changes(summ, {}) == [(summ[0], "proposed", "4")], "proposed appears")
     check(summary_changes(summ, summary_state(summ)) == [], "no change")
     summ2 = [{"Id": 9, "Entry_1": "4", "Entry_2": "5"}]
-    check([c[1:] for c in summary_changes(summ2, summary_state(summ))] == [("końcowa", "5")], "final appears")
+    check([c[1:] for c in summary_changes(summ2, summary_state(summ))] == [("final", "5")], "final appears")
 
     tools = [{"type": "browser_search", "output": "URL: https://exa.ai/search?q=x"},
              {"type": "browser.open", "search_results": {"results": [
@@ -642,7 +855,7 @@ def selftest() -> int:
     dbl = [les("2026-10-01", 3, 30, "Skóra."), les("2026-10-01", 3, 30, "Skóra", 2)]
     check(len(exam_context({"DeadlineAt": "2026-11-01", "Subject": {"Id": 3}}, dbl)["own"]) == 1,
           "double lesson topic deduped")
-    check("od ostatniego sprawdzianu" in context_prompt(ctx) and "- 15.10: Better societies." in context_prompt(ctx),
+    check("since the last test" in context_prompt(ctx) and "- 15.10: Better societies." in context_prompt(ctx),
           context_prompt(ctx))
 
     voc = [les("2026-10-02", 5, 20, "Magistrala I2C"), les("2026-10-02", 6, 20, "Przesyłanie wartości przez port szeregowy"),
@@ -662,6 +875,94 @@ def selftest() -> int:
     check("[S5]" in context_prompt(ctx), "other topics labelled with their subject")
     check(context_prompt(exam_context({"DeadlineAt": "2026-11-13", "Subject": {"Id": 99}}, voc)) == "",
           "unknown subject, no creator -> no context")
+
+    # missed lessons
+    def att(i, day, subj, absent, late=False, removed=False, pos=1):
+        return {"Id": i, "DayAt": day, "TimeSlot": {"Position": pos}, "Subject": {"Id": subj},
+                "PresenceType": {"Absence": absent, "Late": late, "Removed": removed, "Presence": not absent}}
+    al = [att(1, "2026-11-03", 1, True, pos=3), att(2, "2026-11-03", 2, False, late=True),
+          att(3, "2026-11-03", 3, True, pos=1), att(4, "2026-11-04", 1, True, removed=True),
+          att(5, "2026-10-01", 4, True)]
+    m = missed_lessons(al, "2026-11-01")
+    check([l["Id"] for l in m] == [3, 1], "absences only, sorted by position, window and removed respected")
+    ex, hw = missed_followups(m, [{"DeadlineAt": "2026-11-20", "Subject": {"Id": 1}},
+                                  {"DeadlineAt": "2026-11-20", "Subject": {"Id": 4}},
+                                  {"DeadlineAt": "2026-11-02", "Subject": {"Id": 3}}],
+                              [{"DeadlineAt": "2026-11-15T00:00:00", "Subject": {"Id": 3}}], "2026-11-11")
+    check(len(ex) == 1 and len(hw) == 1, "follow-ups: upcoming, only missed subjects")
+
+    # quiz
+    raw = {"questions": [
+        {"q": "Tag for 'She is a doctor'?", "options": ["isn't she?", "doesn't she?", "aren't she?", "is she?"],
+         "answer": 0, "why": "Same auxiliary."},
+        {"q": "bad", "options": ["a", "b", "c"], "answer": 0},
+        {"q": "dup", "options": ["a", "A", "b", "c"], "answer": 1},
+        {"q": "range", "options": ["a", "b", "c", "d"], "answer": 4},
+        {"q": "Second?", "options": ["w", "x", "y", "z"], "answer": 2}]}
+    qs = parse_quiz(raw, "seed")
+    check(len(qs) == 2, "invalid questions dropped")
+    check(qs[0]["options"][qs[0]["answer"]] == "isn't she?" and qs[1]["options"][qs[1]["answer"]] == "y",
+          "answer follows the shuffle")
+    check(parse_quiz(raw, "seed") == qs, "shuffle is deterministic per seed")
+    check(any(parse_quiz(raw, f"s{k}")[0]["answer"] != 0 for k in range(10)), "right answer not always A")
+    check(parse_quiz(None, "x") == [] and parse_quiz({"questions": "x"}, "x") == [], "garbage tolerated")
+
+    # grade edges — weights 1, raw averages straight from values
+    def gr(*vals):
+        return [{"Value": v, "Content": str(v), "Column": {"Weight": 1}} for v in vals]
+    edges = grade_edges({"A": gr(4, 4, 3, 4), "B": gr(4, 4, 4, 4), "C": gr(5, 4, 5, 4), "D": gr(1, 1),
+                         "E": gr(6, 6)})
+    check(edges.get("A") == "drop:4", f"3.75 is on the 4 threshold: {edges}")
+    check("B" not in edges and "D" not in edges and "E" not in edges, "4.00, 1.00 and 6.00 are not on an edge")
+    check("C" not in edges, "4.50 -> final 4, 0.25 below 4.75: not an edge")
+    near = grade_edges({"G": gr(*([5] * 13 + [4] * 7))})
+    check(near.get("G") == "rise:4", f"4.65 is 0.10 below 4.75: {near}")
+    check(edge_alerts({"A": "drop:4", "G": "rise:4"}, {"A": "drop:4"}) == [("G", "rise:4")], "alert once per state")
+
+    # plan diff
+    def pl(pos, subj, room="12", change=None, day="2026-11-12"):
+        return {"DateAt": day, "TimeSlot": {"Position": pos, "Display": "x"}, "Subject": {"Name": subj},
+                "Room": {"Code": room}, "Change": change}
+    old = plan_signature([pl(1, "Fizyka"), pl(2, "Chemia"), pl(3, "WF"), pl(1, "X", day="2026-11-13")], "2026-11-12")
+    new = plan_signature([pl(1, "Fizyka"), pl(2, "Chemia", change={"Type": 1}), pl(4, "Historia")], "2026-11-12")
+    d = plan_diff(old, new)
+    check(len(d) == 3 and d[0].startswith("`2.`") and "WF" in d[1] and "added" in d[2], str(d))
+    check(plan_diff(old, old) == [], "no change -> no lines")
+
+    # exam changes
+    e1 = {"Id": 1, "DeadlineAt": "2026-11-20", "Content": "Unit 8"}
+    e2 = {"Id": 2, "DeadlineAt": "2026-11-21", "Content": "skóra"}
+    st = exam_state([e1, e2])
+    check(exam_changes([e1, e2], st) == [], "unchanged")
+    moved = dict(e1, DeadlineAt="2026-11-27")
+    check(exam_changes([moved, e2], dict(st, **{"2": None})) == [(moved, "2026-11-20", "Unit 8")],
+          "moved exam reported, legacy entry (None) silent")
+
+    # calendar task events
+    ev = task_events([{"Id": 7, "DeadlineAt": "2026-11-30", "Type": "Kartkówka", "Subject": {"Name": "Fizyka "},
+                       "Content": "ruch"}],
+                     [{"Id": 8, "DeadlineAt": "2026-12-31T00:00:00", "Subject": {"Name": "Matematyka"},
+                       "Content": "<p>zad. 1</p>"}, {"Id": 9}])
+    check(len(ev) == 2 and ev[0]["summary"] == "Kartkówka: Fizyka" and ev[0]["end"]["date"] == "2026-12-01",
+          str(ev[0]))
+    check(ev[1]["end"]["date"] == "2027-01-01" and ev[1]["description"] == "zad. 1"
+          and ev[1]["extendedProperties"]["private"]["vulcanscope_id"] == "hw:8", str(ev[1]))
+    check(not task_event_changed(dict(ev[0]), ev[0]) and task_event_changed(dict(ev[0], description="x"), ev[0]),
+          "change detection")
+
+    # heavy-week study plan, Sunday 2026-11-15
+    wk = [{"DeadlineAt": "2026-11-17", "Subject": {"Name": "A"}}, {"DeadlineAt": "2026-11-17", "Subject": {"Name": "B"}},
+          {"DeadlineAt": "2026-11-19", "Subject": {"Name": "C"}}, {"DeadlineAt": "2026-11-16", "Subject": {"Name": "D"}},
+          {"DeadlineAt": "2026-11-30", "Subject": {"Name": "late"}}]
+    sp = study_plan(wk, "2026-11-15")
+    flat = {(d, kind, e["Subject"]["Name"]) for d, items in sp.items() for kind, e in items}
+    check(("2026-11-15", "final review", "D") in flat and ("2026-11-16", "final review", "A") in flat
+          and ("2026-11-18", "final review", "C") in flat, str(sorted(flat)))
+    check(("2026-11-15", "first pass", "A") in flat and ("2026-11-15", "first pass", "B") in flat,
+          "first pass of a Tuesday exam lands on Sunday (only day left)")
+    check(any(d in ("2026-11-16", "2026-11-17") and kind == "first pass" and n == "C" for d, kind, n in flat),
+          "first pass of C on the less loaded day")
+    check(not any(n == "late" for _, _, n in flat), "outside the window")
 
     print(f"selftest OK — {checks} checks")
     return 0
