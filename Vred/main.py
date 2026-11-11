@@ -875,19 +875,47 @@ _powtorka_cache: dict[str, discord.Embed] = {}
 _powtorka_locks: dict[str, asyncio.Lock] = {}
 
 
+CONTEXT_WEEKS = 8   # okno tematow lekcji; i tak tniemy po ostatnim sprawdzianie z przedmiotu
+
+
 async def powtorka_embed(exam: dict) -> discord.Embed:
     subject = (exam.get("Subject") or {}).get("Name", "?")
     topic   = (exam.get("Content") or "").strip() or "brak opisu — tylko nazwa przedmiotu"
-    key     = f"{exam.get('Id')}:{topic}"
+    # data w kluczu: nowy temat lekcji (np. dzisiejsza powtorka) ma trafic do kontekstu
+    key     = f"{exam.get('Id')}:{topic}:{datetime.now(CET):%Y-%m-%d}"
     async with _powtorka_locks.setdefault(key, asyncio.Lock()):
         if key not in _powtorka_cache:
+            # Sama etykieta typu "Unit 8" kaze modelowi zgadywac podrecznik — tematy
+            # lekcji z dziennika mowia, co naprawde bylo przerabiane.
+            try:
+                now     = datetime.now(CET)
+                lessons = await asyncio.to_thread(get_client().get_attendance,
+                                                  now - timedelta(weeks=CONTEXT_WEEKS), now)
+                ctx     = logic.exam_context(exam, lessons)
+            except Exception as e:
+                print(f"[powtorka] brak tematow lekcji: {e}")
+                ctx = {"own": [], "other": [], "since": None}
+            context = logic.context_prompt(ctx)
             prompt = (f"Przedmiot: {subject}. Rodzaj: {(exam.get('Type') or 'sprawdzian').lower()}. "
-                      f"Zakres podany przez nauczyciela: {topic}\n\n"
-                      "Przygotuj powtórkę: 1) najważniejsze zagadnienia i wzory w punktach (max ~12), "
-                      "2) 5 pytań kontrolnych, a odpowiedź do każdego zapisz w spoilerze Discorda ||tak||.")
+                      f"Zakres podany przez nauczyciela: {topic}\n\n")
+            if context:
+                prompt += (context + "\n\nTe tematy lekcji to właściwy zakres — powtórkę oprzyj na nich. "
+                           "Wyszukiwarki użyj, żeby uzupełnić treść tych tematów (reguły, wzory, przykłady), "
+                           "a nie żeby zgadywać, czego dotyczy etykieta nauczyciela w jakimś podręczniku. "
+                           "Pomiń tematy organizacyjne i zagadnienia spoza tej listy.\n\n")
+            prompt += ("Przygotuj powtórkę: 1) najważniejsze zagadnienia i wzory w punktach (max ~12), "
+                       "2) 5 pytań kontrolnych, a odpowiedź do każdego zapisz w spoilerze Discorda ||tak||.")
             text, sources = await asyncio.to_thread(ai.ask, prompt)
             title = f"🧠 Powtórka: {exam_label(exam)} — {fmt_date(exam_date(exam))}"
-            _powtorka_cache[key] = ai_embed(title, text, sources)
+            embed = ai_embed(title, text, sources)
+            if ctx["own"] or ctx["other"]:
+                used = f"{len(ctx['own'])} tematów lekcji"
+                if ctx["since"]:
+                    used += f" od sprawdzianu {ctx['since'][8:10]}.{ctx['since'][5:7]}"
+                if ctx["other"]:
+                    used += f" + {len(ctx['other'])} z innych przedmiotów nauczyciela"
+                embed.add_field(name="Zakres z dziennika", value=used, inline=False)
+            _powtorka_cache[key] = embed
     return _powtorka_cache[key]
 
 

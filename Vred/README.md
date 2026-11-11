@@ -31,7 +31,7 @@ Vred is a Discord bot that automatically fetches and posts your school schedule 
 - `/sprawdziany [tygodnie]` — Upcoming exams (default 2 weeks)
 - `/nastepny` — Time until the next exam
 - `/srednie [cel]` — Weighted averages for the current period plus the predicted final grade per subject (x.75 rounds up; owner only, ephemeral). With `cel` (e.g. `4.75`) it targets the mean of final grades and lists the fewest grades to raise by one step, never to a 6, or says the target is out of reach
-- `/powtorka [przedmiot]` — AI revision for the next exam (or the next one of that subject), with sources
+- `/powtorka [przedmiot]` — AI revision for the next exam (or the next one of that subject), with sources; the scope comes from the register's lesson topics since the last test in that subject (for a retake: the topics before it), so a bare label like "Unit 8" is no longer guessed from some random textbook. Teachers who run several vocational subjects mix material between them, so their other subjects' topics are added when they share a keyword with the exam description
 - `/szukaj <pytanie>` — AI answer grounded in a web search, with sources
 - `/zadania [dni]` — Homework due in the next N days (default 14)
 - `/tematy [offset]` — Lesson topics for a day (0 = today, -1 = yesterday)

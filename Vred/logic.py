@@ -384,6 +384,103 @@ def tables_to_lists(text: str) -> str:
     return re.sub(r"(?i)<br\s*/?>", "\n", "\n".join(out))
 
 
+# --------------------------------------------------------------------------- #
+# Exam context — lesson topics that tell the AI what "Unit 8" actually covers
+# --------------------------------------------------------------------------- #
+# The teacher's description is often a bare label ("Unit 8", "Tematy: 32-35"),
+# so a web search guesses a textbook and invents the scope. lesson/byPupil has
+# the real topics. Lessons after the last test in that subject are the scope.
+
+NOISE_TOPIC = re.compile(r"(?i)odbył[ao]? się|wyjści|akademi|wycieczk|\bkin[oa]\b|rekolekc|apel\b|ewakuac")
+TEST_TOPIC = re.compile(r"(?i)\b(test|sprawdzian|kartkówka|praca klasowa)\b")
+RETAKE = re.compile(r"(?i)poprawa|poprawk")
+_WORD = re.compile(r"\w{5,}")
+
+
+def _topic(l: dict) -> str:
+    return (l.get("Topic") or "").strip()
+
+
+def _words(text: str) -> set[str]:
+    # crude stem: first 5 letters, so "ESP32" ~ "ESP32", "pętle" ~ "pętla"
+    return {w[:5].lower() for w in _WORD.findall(text or "")}
+
+
+def exam_context(exam: dict, lessons, max_topics: int = 25) -> dict:
+    """Lesson topics behind an exam.
+
+    own   — topics of the exam's subject, from after the last test in it
+            (unless the exam is a retake), oldest first, capped at max_topics.
+    other — topics the same teacher gave in OTHER subjects in that window; a
+            teacher with several vocational subjects mixes them, so they are
+            included only when they share a word with the exam description or
+            the subject has at most one topic of its own.
+    """
+    subj_id = (exam.get("Subject") or {}).get("Id")
+    teacher_id = (exam.get("Creator") or {}).get("Id")
+    deadline = exam.get("DeadlineAt") or (exam.get("Deadline") or {}).get("Date") or "9999"
+    content = exam.get("Content") or ""
+
+    usable = sorted((l for l in lessons
+                     if (l.get("DayAt") or "") < deadline and _topic(l)
+                     and not NOISE_TOPIC.search(_topic(l))),
+                    key=lambda l: (l.get("DayAt") or "", l.get("LessonNumber") or 0))
+    own = [l for l in usable if (l.get("Subject") or {}).get("Id") == subj_id]
+
+    since = None
+    marks = [i for i, l in enumerate(own) if TEST_TOPIC.search(_topic(l))]
+    if RETAKE.search(content):
+        # retake: the material is what came BEFORE the original test
+        if marks:
+            own = own[:marks[-1]]
+    elif marks and marks[-1] < len(own) - 1:
+        since = own[marks[-1]]["DayAt"]
+        own = own[marks[-1] + 1:]
+    dedup, seen_own = [], set()          # double lessons repeat the topic
+    for l in own:
+        k = _topic(l).rstrip(".").lower()
+        if k not in seen_own:
+            seen_own.add(k)
+            dedup.append(l)
+    own = dedup[-max_topics:]
+
+    other, seen = [], {_topic(l).rstrip(".").lower() for l in own}
+    if teacher_id is not None:
+        want = _words(content)
+        for l in usable:
+            if ((l.get("Subject") or {}).get("Id") == subj_id
+                    or (l.get("TeacherPrimary") or {}).get("Id") != teacher_id
+                    or (since and l["DayAt"] <= since)
+                    or TEST_TOPIC.search(_topic(l))):
+                continue
+            key = _topic(l).rstrip(".").lower()
+            if key in seen:
+                continue
+            if len(own) < 2 or want & _words(_topic(l)):
+                seen.add(key)
+                other.append(l)
+    return {"own": own, "other": other[-max_topics:], "since": since}
+
+
+def context_prompt(ctx: dict) -> str:
+    """Lesson topics as prompt text; '' when there is nothing to add."""
+    def line(l, with_subject=False):
+        d = l["DayAt"]
+        subj = f" [{(l.get('Subject') or {}).get('Name', '?').strip()}]" if with_subject else ""
+        return f"- {d[8:10]}.{d[5:7]}{subj}: {_topic(l)}"
+
+    parts = []
+    if ctx["own"]:
+        head = "Tematy lekcji z dziennika"
+        head += " od ostatniego sprawdzianu" if ctx["since"] else ""
+        parts.append(head + " (od najstarszych):\n" + "\n".join(line(l) for l in ctx["own"]))
+    if ctx["other"]:
+        parts.append("Tematy tego samego nauczyciela z innych przedmiotów (bywają przemieszane "
+                     "— użyj tylko tych, które pasują do zakresu):\n"
+                     + "\n".join(line(l, True) for l in ctx["other"]))
+    return "\n\n".join(parts)
+
+
 def new_messages(messages, seen: set[str]) -> list[dict]:
     """Unseen, not withdrawn, oldest first."""
     fresh = [m for m in messages
@@ -523,6 +620,48 @@ def selftest() -> int:
     tbl = "Wstęp\n| # | Pojęcie | Opis |\n|---|:---|---|\n| 1 | **Integracja** | łączenie<br>państw [1] |\n| 2 | UE | 27 państw |\nKoniec"
     check(tables_to_lists(tbl) == "Wstęp\n• **Integracja** — łączenie; państw [1]\n• UE — 27 państw\nKoniec", repr(tables_to_lists(tbl)))
     check(tables_to_lists("a | b") == "a | b", "pipe in prose untouched")
+
+    # exam context — shapes from lesson/byPupil and exam/byPupil (2026-11)
+    def les(day, subj, teacher, topic, n=1):
+        return {"DayAt": day, "LessonNumber": n, "Topic": topic,
+                "Subject": {"Id": subj, "Name": f"S{subj}"}, "TeacherPrimary": {"Id": teacher}}
+    eng = [les("2026-10-08", 1, 10, "Review 7.", 12), les("2026-10-08", 1, 10, "Test 7.", 13),
+           les("2026-10-15", 1, 10, "Better societies."), les("2026-10-22", 1, 11, "Causative forms"),
+           les("2026-10-29", 1, 10, "Conditionals."), les("2026-11-01", 1, 10, "Lekcja odbyła się na 3 godz."),
+           les("2026-11-05", 1, 10, "Review 8."), les("2026-11-12", 1, 10, "Test 8."),
+           les("2026-10-29", 2, 10, "Unreal Past in business")]
+    exam = {"DeadlineAt": "2026-11-12", "Content": "Unit 8", "Subject": {"Id": 1}, "Creator": {"Id": 10}}
+    ctx = exam_context(exam, eng)
+    check([_topic(l) for l in ctx["own"]] == ["Better societies.", "Causative forms", "Conditionals.", "Review 8."],
+          str([_topic(l) for l in ctx["own"]]))
+    check(ctx["since"] == "2026-10-08", "cut after the last test, substitute teacher kept")
+    check(ctx["other"] == [], "other subject not related to 'Unit 8' and own is long enough")
+    retake = dict(exam, Content="Unit 7 - poprawa")
+    check([_topic(l) for l in exam_context(retake, eng)["own"]] == ["Review 7."],
+          "retake: only the material before the original test")
+    dbl = [les("2026-10-01", 3, 30, "Skóra."), les("2026-10-01", 3, 30, "Skóra", 2)]
+    check(len(exam_context({"DeadlineAt": "2026-11-01", "Subject": {"Id": 3}}, dbl)["own"]) == 1,
+          "double lesson topic deduped")
+    check("od ostatniego sprawdzianu" in context_prompt(ctx) and "- 15.10: Better societies." in context_prompt(ctx),
+          context_prompt(ctx))
+
+    voc = [les("2026-10-02", 5, 20, "Magistrala I2C"), les("2026-10-02", 6, 20, "Przesyłanie wartości przez port szeregowy"),
+           les("2026-10-16", 5, 20, "Budowa płytki ESP32."), les("2026-10-16", 6, 20, "Budowa płytki ESP32"),
+           les("2026-10-23", 6, 20, "Operatory arytmetyczne"), les("2026-10-28", 7, 20, "Flexbox"),
+           les("2026-10-28", 6, 21, "Programowanie ESP32 w MicroPython")]
+    ex6 = {"DeadlineAt": "2026-11-13", "Content": "ESP32 i port szeregowy", "Subject": {"Id": 6}, "Creator": {"Id": 20}}
+    ctx = exam_context(ex6, voc)
+    check(len(ctx["own"]) == 4 and ctx["other"] == [],
+          "duplicate ESP32 topic deduped, unrelated I2C/Flexbox left out: " + str([_topic(l) for l in ctx["other"]]))
+    ex7 = {"DeadlineAt": "2026-11-13", "Content": "ESP32", "Subject": {"Id": 7}, "Creator": {"Id": 20}}
+    ctx = exam_context(ex7, voc)
+    check([_topic(l) for l in ctx["own"]] == ["Flexbox"], "own subject")
+    check({_topic(l) for l in ctx["other"]} == {"Magistrala I2C", "Przesyłanie wartości przez port szeregowy",
+                                               "Budowa płytki ESP32.", "Operatory arytmetyczne"},
+          "few own topics -> teacher's other subjects, deduped, other teacher excluded")
+    check("[S5]" in context_prompt(ctx), "other topics labelled with their subject")
+    check(context_prompt(exam_context({"DeadlineAt": "2026-11-13", "Subject": {"Id": 99}}, voc)) == "",
+          "unknown subject, no creator -> no context")
 
     print(f"selftest OK — {checks} checks")
     return 0
