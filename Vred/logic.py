@@ -59,17 +59,17 @@ def lesson_view(l: dict) -> dict:
 def change_text(v: dict) -> str:
     """One-line description of what changed, '' for a normal lesson."""
     if v["kind"] == "cancelled":
-        return f"❌ odwołane{f' ({v['note'].lower()})' if v['note'] else ''}"
+        return f"❌ cancelled{f' ({v['note'].lower()})' if v['note'] else ''}"
     if v["kind"] != "subst":
         return ""
     parts = []
     if v["subject"] != v["orig_subject"]:
-        parts.append(f"zamiast {v['orig_subject']}")
+        parts.append(f"instead of {v['orig_subject']}")
     if v["teacher_changed"]:
         parts.append(v["teacher"])
     if v["note"] and v["note"].lower() != "zastępstwo":
         parts.append(v["note"].lower())
-    return "⚠️ zastępstwo" + (f" — {', '.join(parts)}" if parts else "")
+    return "⚠️ substitution" + (f" — {', '.join(parts)}" if parts else "")
 
 
 # --------------------------------------------------------------------------- #
@@ -725,7 +725,7 @@ def selftest() -> int:
         "TeacherAbsenceEffectName": "Zastępstwo", "Room": None, "TimeSlot": None})
     v = lesson_view(subst)
     check(v["subject"] == "Matematyka" and v["room"] == "69", "subst takes new subject, keeps room")
-    check(change_text(v) == "⚠️ zastępstwo — zamiast Język polski, Elżbieta K", change_text(v))
+    check(change_text(v) == "⚠️ substitution — instead of Język polski, Elżbieta K", change_text(v))
 
     merge = dict(base, Change={"Type": 2}, Substitution={
         "Subject": {"Name": "Historia"}, "TeacherPrimary": {"DisplayName": "M B"},
@@ -736,11 +736,11 @@ def selftest() -> int:
         "TeacherAbsenceEffectName": "Uczniowie zwolnieni do domu", "Reason": None})
     v = lesson_view(cancelled)
     check(v["kind"] == "cancelled", "cancelled kind")
-    check(change_text(v) == "❌ odwołane (uczniowie zwolnieni do domu)", change_text(v))
+    check(change_text(v) == "❌ cancelled (uczniowie zwolnieni do domu)", change_text(v))
 
     # byPupil has Change but no Substitution — still flagged, no crash
     v = lesson_view(dict(base, Change={"Type": 2}))
-    check(v["kind"] == "subst" and change_text(v) == "⚠️ zastępstwo", "subst without details")
+    check(v["kind"] == "subst" and change_text(v) == "⚠️ substitution", "subst without details")
 
     def g(i, content, value, weight=1.0, subj="Fizyka"):
         return {"Id": i, "Content": content, "Value": value,

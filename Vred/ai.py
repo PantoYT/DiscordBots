@@ -53,7 +53,7 @@ def _run(make_body) -> dict:
     if not key:
         raise AIError("GROQ_API_KEY is missing from .env")
     longest = 0.0
-    timed_out = False
+    timed_out = daily = False
     for model in dict.fromkeys((MODEL, FALLBACK)):
         body = make_body(model)
         waited = 0.0
@@ -71,6 +71,8 @@ def _run(make_body) -> dict:
                 continue
             if r.status_code != 429:
                 break
+            # the 429 body names the limit, e.g. "... on tokens per day (TPD) ..."
+            daily = daily or "per day" in r.text
             wait = float(r.headers.get("retry-after") or 20) + 1
             if waited + wait > MAX_WAIT:
                 longest = max(longest, wait)
@@ -84,7 +86,11 @@ def _run(make_body) -> dict:
         return r.json()["choices"][0]["message"]
     if timed_out and not longest:
         raise AIError("Groq did not answer in time — try again in a minute")
-    raise AIError(f"free Groq limit reached — try again in about {max(1, round(longest / 60))} min")
+    minutes = max(1, round(longest / 60))
+    if daily:
+        raise AIError(f"today's free AI budget is used up — it refills gradually, "
+                      f"try again in about {minutes} min")
+    raise AIError(f"free Groq limit reached — try again in about {minutes} min")
 
 
 def ask(prompt: str, max_tokens: int = 1500) -> tuple[str, list[tuple[str, str]]]:

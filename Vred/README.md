@@ -13,7 +13,7 @@ stays in Polish, and AI answers default to Polish (`AI_LANGUAGE`) because the ex
 
 ## Features
 - 📅 **Schedule**: View your lesson plan for today, tomorrow, or any day
-- 📝 **Exams**: Browse upcoming tests and sprawdziany
+- 📝 **Exams**: Browse upcoming tests (sprawdziany, kartkówki)
 - ⏰ **Next Exam**: Quick look at what's coming up first
 - 🔔 **Auto Notifications**: Bot automatically checks for new exams every hour and posts them to your channel
 - 🔁 **Exam changes**: when an announced exam is moved to another day or its scope is rewritten, the exams channel gets an old → new notice
@@ -40,8 +40,8 @@ stays in Polish, and AI answers default to Polish (`AI_LANGUAGE`) because the ex
 - `/week [which]` — Whole week: previous, current or next
 - `/exams [weeks]` — Upcoming exams (default 2 weeks)
 - `/next` — Time until the next exam
-- `/revise [subject]` — AI revision for the next exam (or the next one of that subject), with sources; the scope comes from the register's lesson topics since the last test in that subject (for a retake: the topics before it), so a bare label like "Unit 8" is no longer guessed from some random textbook. Teachers who run several vocational subjects mix material between them, so their other subjects' topics are added when they share a keyword with the exam description. The answer has a 🧩 *Quiz* button
-- `/quiz [subject]` — Multiple-choice quiz (8 questions, `QUIZ_QUESTIONS`) built from the revision; answers by buttons, an explanation after each, and the wrong ones are saved and offered again before the exam
+- `/revise [exam]` — AI revision for an exam picked from the list (type to filter; empty = the next exam), with sources; the scope comes from the register's lesson topics since the last test in that subject (for a retake: the topics before it), so a bare label like "Unit 8" is no longer guessed from some random textbook. Teachers who run several vocational subjects mix material between them, so their other subjects' topics are added when they share a keyword with the exam description. The answer has a 🧩 *Quiz* button
+- `/quiz [exam]` — Multiple-choice quiz for an exam picked from the list (8 questions, `QUIZ_QUESTIONS`) built from the revision; answers by buttons, an explanation after each, and the wrong ones are saved and offered again before the exam
 - `/ask <question>` — AI answer grounded in a web search, with sources
 - `/homework [days]` — Homework due in the next N days (default 14)
 - `/topics [offset]` — Lesson topics for a day (0 = today, -1 = yesterday)
@@ -66,8 +66,8 @@ search, about 2–3k tokens.
 1. Create a `.env` file containing:
    - `OWNER_ID` — Your Discord user ID
    - `DISCORD_TOKEN` — Your Discord bot token
-   - `SCHEDULE_CHANNEL` — Channel name for schedule (default: `plan-lekcji`)
-   - `EXAMS_CHANNEL` — Channel name for exam notifications (default: `sprawdziany`)
+   - `SCHEDULE_CHANNEL` — Channel name for schedule (default: `timetable`; an old `plan-lekcji` channel is renamed on startup)
+   - `EXAMS_CHANNEL` — Channel name for exam notifications (default: `exams`; an old `sprawdziany` channel is renamed on startup)
    - `CHECK_INTERVAL` — How often to check for new exams in minutes (default: `60`)
    - `MESSAGES_INTERVAL` — How often to check for new messages in minutes (default: `15`)
    - `GROQ_API_KEY` — optional, enables `/revise`, `/quiz`, `/ask` and the AI buttons; free key at https://console.groq.com/keys (no card)

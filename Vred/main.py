@@ -23,8 +23,13 @@ load_dotenv(DATA_DIR / ".env")
 
 TOKEN            = os.getenv("DISCORD_TOKEN")
 OWNER_ID         = int(os.getenv("OWNER_ID"))
-SCHEDULE_CHANNEL = os.getenv("SCHEDULE_CHANNEL", "plan-lekcji")
-EXAMS_CHANNEL    = os.getenv("EXAMS_CHANNEL", "sprawdziany")
+SCHEDULE_CHANNEL = os.getenv("SCHEDULE_CHANNEL", "timetable")
+EXAMS_CHANNEL    = os.getenv("EXAMS_CHANNEL", "exams")
+# Channel names used before the bot went English (2026-11) — renamed in place on
+# startup, so the history and the pinned timetable message stay.
+LEGACY_CHANNELS = {SCHEDULE_CHANNEL: "plan-lekcji", EXAMS_CHANNEL: "sprawdziany"}
+CHANNEL_TOPICS = {SCHEDULE_CHANNEL: "Timetable — kept up to date by Vred",
+                  EXAMS_CHANNEL: "Exams, homework and reminders from Vred"}
 CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", 60))
 
 CET               = pytz.timezone("Europe/Warsaw")
@@ -851,13 +856,45 @@ async def find_exam(exam_id: int) -> dict | None:
     return next((e for e in exams if e.get("Id") == exam_id), None)
 
 
-async def next_exam(subject: str = "") -> dict | None:
+async def upcoming_exams() -> list:
     now   = datetime.now(CET)
     exams = await asyncio.to_thread(get_client().get_exams, now, now + timedelta(weeks=4))
-    exams = sorted(exams, key=lambda e: exam_date(e) or "9999")
+    return sorted(exams, key=lambda e: exam_date(e) or "9999")
+
+
+async def next_exam(subject: str = "") -> dict | None:
+    """The exam picked in the autocomplete (its Id), else the next one whose
+    subject contains the typed text, else simply the next one."""
+    exams = await upcoming_exams()
+    if subject.isdigit():
+        picked = next((e for e in exams if str(e.get("Id")) == subject), None)
+        if picked:
+            return picked
     if subject:
         exams = [e for e in exams if subject.lower() in exam_label(e).lower()]
     return exams[0] if exams else None
+
+
+# Autocomplete fires on every keystroke — the exam list is cached for a few minutes.
+_exam_choices: dict = {"at": 0.0, "exams": []}
+
+
+async def exam_autocomplete(interaction: discord.Interaction, current: str):
+    import time
+    if time.monotonic() - _exam_choices["at"] > 300:
+        _exam_choices.update(at=time.monotonic(), exams=await upcoming_exams())
+    cur, out = current.lower(), []
+    for e in _exam_choices["exams"]:
+        name = f"{fmt_short(exam_date(e))} · {exam_label(e)} · {(e.get('Content') or '').strip()}"
+        name = " ".join(name.split())          # descriptions can be multi-line
+        if cur in name.lower():
+            out.append(discord.app_commands.Choice(name=name[:100], value=str(e["Id"])))
+    return out[:25]
+
+
+def fail(e: Exception) -> str:
+    """AI limits are expected on the free tier — say it plainly, not as a crash."""
+    return f"⏳ {e}" if isinstance(e, ai.AIError) else f"❌ `{e}`"
 
 
 # One revision eats 10-60k tokens against an 8k/min limit — the result is kept in
@@ -945,7 +982,7 @@ class RevisionButton(discord.ui.DynamicItem[discord.ui.Button], template=r"vred:
                 return
             await send_revision(interaction.followup.send, exam)
         except Exception as e:
-            await interaction.followup.send(f"❌ `{e}`")
+            await interaction.followup.send(fail(e))
 
 
 # --- quiz --------------------------------------------------------------------
@@ -1066,7 +1103,7 @@ class QuizStartButton(discord.ui.DynamicItem[discord.ui.Button], template=r"vred
             qid, qz = await build_quiz(exam)
             await interaction.followup.send(embed=quiz_question_embed(qz), view=quiz_view(qid, qz))
         except Exception as e:
-            await interaction.followup.send(f"❌ `{e}`")
+            await interaction.followup.send(fail(e))
 
 
 class QuizAnswerButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -1225,7 +1262,7 @@ class MissedButton(discord.ui.DynamicItem[discord.ui.Button],
             view = missed_view(self.since, self.until) if missed else None
             await interaction.followup.send(embed=embed, ephemeral=True, **({"view": view} if view else {}))
         except Exception as e:
-            await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
+            await interaction.followup.send(fail(e), ephemeral=True)
 
 
 class MissedExplainButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -1266,7 +1303,7 @@ class MissedExplainButton(discord.ui.DynamicItem[discord.ui.Button],
             await interaction.followup.send(embed=ai_embed("🧠 Catch-up on missed topics", text, sources),
                                             ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
+            await interaction.followup.send(fail(e), ephemeral=True)
 
 
 bot.add_dynamic_items(RevisionButton, QuizStartButton, QuizAnswerButton, QuizRetryButton,
@@ -1329,7 +1366,7 @@ async def day_plan(interaction: discord.Interaction, offset: int, table: bool = 
         else:
             await interaction.followup.send(embed=embed)
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`")
+        await interaction.followup.send(fail(e))
 
 
 @bot.tree.command(name="today", description="Today's timetable")
@@ -1363,7 +1400,7 @@ async def slash_week(interaction: discord.Interaction, which: str = "current"):
         lessons = await asyncio.to_thread(get_client().get_lessons, monday, monday + timedelta(days=6))
         await interaction.followup.send(embed=week_embed(lessons, monday, which))
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`")
+        await interaction.followup.send(fail(e))
 
 
 @bot.tree.command(name="exams", description="Upcoming exams (2 weeks by default)")
@@ -1386,7 +1423,7 @@ async def slash_exams(interaction: discord.Interaction, weeks: int = 2):
         for exam in exams:
             await interaction.followup.send(embed=exam_embed(exam, exams))
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`")
+        await interaction.followup.send(fail(e))
 
 
 @bot.tree.command(name="next", description="Time until the next exam")
@@ -1410,40 +1447,42 @@ async def slash_next(interaction: discord.Interaction):
         embed.set_footer(text=FOOTER)
         await interaction.followup.send(embed=embed)
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`")
+        await interaction.followup.send(fail(e))
 
 
-@bot.tree.command(name="revise", description="AI revision for the next exam (AI + web search)")
-@discord.app_commands.describe(subject="Only exams whose subject contains this text")
-async def slash_revise(interaction: discord.Interaction, subject: str = ""):
+@bot.tree.command(name="revise", description="AI revision for an exam (AI + web search)")
+@discord.app_commands.describe(exam="Pick an exam, or type a subject; empty = the next exam")
+@discord.app_commands.autocomplete(exam=exam_autocomplete)
+async def slash_revise(interaction: discord.Interaction, exam: str = ""):
     if not await ai_ready(interaction):
         return
     await interaction.response.defer()
     try:
-        exam = await next_exam(subject)
-        if not exam:
-            await interaction.followup.send(f"No upcoming exams{f' in “{subject}”' if subject else ''}.")
+        picked = await next_exam(exam)
+        if not picked:
+            await interaction.followup.send(f"No upcoming exams{f' in “{exam}”' if exam else ''}.")
             return
-        await send_revision(interaction.followup.send, exam)
+        await send_revision(interaction.followup.send, picked)
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`")
+        await interaction.followup.send(fail(e))
 
 
-@bot.tree.command(name="quiz", description="Multiple-choice quiz for the next exam")
-@discord.app_commands.describe(subject="Only exams whose subject contains this text")
-async def slash_quiz(interaction: discord.Interaction, subject: str = ""):
+@bot.tree.command(name="quiz", description="Multiple-choice quiz for an exam")
+@discord.app_commands.describe(exam="Pick an exam, or type a subject; empty = the next exam")
+@discord.app_commands.autocomplete(exam=exam_autocomplete)
+async def slash_quiz(interaction: discord.Interaction, exam: str = ""):
     if not await ai_ready(interaction):
         return
     await interaction.response.defer()
     try:
-        exam = await next_exam(subject)
-        if not exam:
-            await interaction.followup.send(f"No upcoming exams{f' in “{subject}”' if subject else ''}.")
+        picked = await next_exam(exam)
+        if not picked:
+            await interaction.followup.send(f"No upcoming exams{f' in “{exam}”' if exam else ''}.")
             return
-        qid, qz = await build_quiz(exam)
+        qid, qz = await build_quiz(picked)
         await interaction.followup.send(embed=quiz_question_embed(qz), view=quiz_view(qid, qz))
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`")
+        await interaction.followup.send(fail(e))
 
 
 @bot.tree.command(name="ask", description="Ask the AI with web search (like an AI overview)")
@@ -1455,7 +1494,7 @@ async def slash_ask(interaction: discord.Interaction, question: str):
         text, sources = await asyncio.to_thread(ai.ask, question, 1000)
         await interaction.followup.send(embed=ai_embed(f"🔎 {question}", text, sources))
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`")
+        await interaction.followup.send(fail(e))
 
 
 @bot.tree.command(name="homework", description="Homework for the coming days (14 by default)")
@@ -1475,7 +1514,7 @@ async def slash_homework(interaction: discord.Interaction, days: int = 14):
         embed.set_footer(text=FOOTER)
         await interaction.followup.send(embed=embed)
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`")
+        await interaction.followup.send(fail(e))
 
 
 @bot.tree.command(name="topics", description="Lesson topics of a day (0 = today, -1 = yesterday)")
@@ -1496,7 +1535,7 @@ async def slash_topics(interaction: discord.Interaction, offset: int = 0):
         embed.set_footer(text=FOOTER)
         await interaction.followup.send(embed=embed)
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`")
+        await interaction.followup.send(fail(e))
 
 
 @bot.tree.command(name="missed", description="Lessons you missed, with topics and what is coming up (owner, private)")
@@ -1512,7 +1551,7 @@ async def slash_missed(interaction: discord.Interaction, days: discord.app_comma
         view = missed_view(since, until) if missed else None
         await interaction.followup.send(embed=embed, ephemeral=True, **({"view": view} if view else {}))
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
+        await interaction.followup.send(fail(e), ephemeral=True)
 
 
 @bot.tree.command(name="attendance", description="Attendance this term (owner only, only you see it)")
@@ -1540,7 +1579,7 @@ async def slash_attendance(interaction: discord.Interaction):
         embed.set_footer(text="Vred • counted: present / (present + absent)")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
+        await interaction.followup.send(fail(e), ephemeral=True)
 
 
 @bot.tree.command(name="messages", description="Latest register messages (owner only, only you see it)")
@@ -1562,7 +1601,7 @@ async def slash_messages(interaction: discord.Interaction, count: int = 5):
             await interaction.followup.send("Messages need eduVULCAN Premium since November 2026 — "
                                             "the free account no longer gets them.", ephemeral=True)
             return
-        await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
+        await interaction.followup.send(fail(e), ephemeral=True)
 
 
 def raised_label(g: dict) -> str:
@@ -1628,7 +1667,7 @@ async def slash_grades(interaction: discord.Interaction,
                               f"threshold • + = +{logic.PLUS_MOD}, − = {logic.MINUS_MOD} • {len(grades)} grades • Vred")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ `{e}`", ephemeral=True)
+        await interaction.followup.send(fail(e), ephemeral=True)
 
 
 @bot.tree.command(name="info", description="Bot status (owner only)")
@@ -1661,10 +1700,7 @@ async def slash_setup(interaction: discord.Interaction):
 
     await interaction.response.defer()
     created, existing = [], []
-    for ch_name, topic in (
-        (SCHEDULE_CHANNEL, "Timetable — kept up to date by Vred"),
-        (EXAMS_CHANNEL,    "Exams, homework and reminders from Vred"),
-    ):
+    for ch_name, topic in CHANNEL_TOPICS.items():
         if discord.utils.get(guild.text_channels, name=ch_name):
             existing.append(ch_name)
         else:
@@ -1785,6 +1821,20 @@ async def before_uptime():
 # Events
 # ---------------------------------------------------------------------------
 
+async def rename_legacy_channels(guild: discord.Guild):
+    for new, old in LEGACY_CHANNELS.items():
+        if new == old or discord.utils.get(guild.text_channels, name=new):
+            continue
+        ch = discord.utils.get(guild.text_channels, name=old)
+        if ch is None:
+            continue
+        try:
+            await ch.edit(name=new, topic=CHANNEL_TOPICS[new], reason="Vred switched to English")
+            print(f"Renamed #{old} -> #{new} in {guild.name}")
+        except discord.HTTPException as e:
+            print(f"Could not rename #{old} in {guild.name}: {e}")
+
+
 @bot.event
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
@@ -1802,6 +1852,7 @@ async def on_ready():
         print(f"Failed to sync commands: {e}")
 
     for guild in bot.guilds:
+        await rename_legacy_channels(guild)
         channel_names = [c.name for c in guild.text_channels]
         missing = [ch for ch in (SCHEDULE_CHANNEL, EXAMS_CHANNEL) if ch not in channel_names]
         if missing:
