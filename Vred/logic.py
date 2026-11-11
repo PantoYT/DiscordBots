@@ -753,6 +753,36 @@ def week_grades(grades, since: str) -> dict[str, dict]:
     return dict(sorted(out.items()))
 
 
+# --------------------------------------------------------------------------- #
+# Timing jitter — no requests at :00 sharp or on an exact period
+# --------------------------------------------------------------------------- #
+# Every request is signed with the device key, so the register sees each one.
+# A bot hitting it at 07:00:00 and every 60.0 minutes stands out; a phone does not.
+
+def daily_time(day: str, name: str, hour: int, minute: int = 0, spread: int = 7) -> tuple[int, int]:
+    """hour:minute moved by a per-day offset in [-spread, +spread] minutes. Seeded by
+    day and task name, so it stays put all day (a restart does not re-roll it)."""
+    import random
+    total = hour * 60 + minute + random.Random(f"{day}:{name}").randint(-spread, spread)
+    return divmod(max(0, min(total, 24 * 60 - 1)), 60)
+
+
+def jittered(minutes: float, spread: float = 0.25, rng=None) -> float:
+    """minutes × a random factor in [1 - spread, 1 + spread]."""
+    import random
+    return minutes * (rng or random).uniform(1 - spread, 1 + spread)
+
+
+def lucky_slots(day: str, start: tuple[int, int] = (6, 0), end: tuple[int, int] = (8, 0),
+                tries: int = 3) -> list[tuple[int, int]]:
+    """`tries` random check times inside [start, end), at least 15 min apart, fixed per day."""
+    import random
+    rng = random.Random(f"{day}:lucky")
+    lo, hi = start[0] * 60 + start[1], end[0] * 60 + end[1]
+    step = (hi - lo) // tries
+    return [divmod(lo + i * step + rng.randint(0, max(0, step - 15)), 60) for i in range(tries)]
+
+
 def new_messages(messages, seen: set[str]) -> list[dict]:
     """Unseen, not withdrawn, oldest first."""
     fresh = [m for m in messages
@@ -1046,6 +1076,23 @@ def selftest() -> int:
                       {"Value": 4, "Content": "4", "CreatedAt": "2026-10-01T10:00:00", "Column": {"Weight": 1, "Subject": {"Name": "Chemia"}}}],
                      "2026-11-09")
     check(list(wg) == ["Fizyka"] and wg["Fizyka"]["before"] == 3.0 and wg["Fizyka"]["after"] == 4.0, str(wg))
+
+    # timing jitter
+    import random as _r
+    t = daily_time("2026-11-12", "reminder", 19)
+    check(t == daily_time("2026-11-12", "reminder", 19), "same day, same time")
+    check((18, 53) <= t <= (19, 7), f"within ±7 min: {t}")
+    days = {daily_time(f"2026-11-{d:02d}", "reminder", 19) for d in range(1, 29)}
+    check(len(days) > 5, "varies between days")
+    check(daily_time("2026-11-12", "x", 0, 0, 7) >= (0, 0), "clamped at midnight")
+    rng = _r.Random(1)
+    vals = [jittered(60, 0.25, rng) for _ in range(200)]
+    check(45 <= min(vals) and max(vals) <= 75 and max(vals) - min(vals) > 20, "jitter spread")
+    for d in range(1, 29):
+        sl = lucky_slots(f"2026-11-{d:02d}")
+        mins = [h * 60 + m for h, m in sl]
+        check(len(sl) == 3 and (6, 0) <= sl[0] and sl[-1] < (8, 0)
+              and all(b - a >= 15 for a, b in zip(mins, mins[1:])), f"lucky slots {sl}")
 
     print(f"selftest OK — {checks} checks")
     return 0

@@ -3,6 +3,7 @@ from discord.ext import commands, tasks
 import asyncio
 import os
 import json
+import random
 import secrets
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -91,6 +92,16 @@ def load_seen_exams() -> dict:
     those become None (= announced, details unknown, never reported as changed)."""
     data = load_json(SEEN_EXAMS_FILE, {})
     return {str(i): None for i in data} if isinstance(data, list) else data
+
+
+def rejitter(loop, minutes: float):
+    """Next run after minutes ±25 % — the register never sees an exact period."""
+    loop.change_interval(minutes=logic.jittered(minutes))
+
+
+async def stagger(lo: float = 20, hi: float = 240):
+    """Spread the first polls after a restart over a few minutes."""
+    await asyncio.sleep(random.uniform(lo, hi))
 
 
 def get_client() -> VulcanClient:
@@ -321,7 +332,7 @@ async def daily_schedule():
     global last_schedule_run
     now   = datetime.now(CET)
     today = today_str(now)
-    if now.hour < DAILY_HOUR or last_schedule_run == today:
+    if (now.hour, now.minute) < logic.daily_time(today, "schedule", DAILY_HOUR) or last_schedule_run == today:
         return
     last_schedule_run = today
 
@@ -375,7 +386,8 @@ async def run_calendar_sync(reason: str):
 @tasks.loop(minutes=1)
 async def calendar_sync_task():
     now = datetime.now(CET)
-    if last_calendar_sync == today_str(now) or now.hour < CALENDAR_SYNC_HOUR:
+    if (last_calendar_sync == today_str(now)
+            or (now.hour, now.minute) < logic.daily_time(today_str(now), "calendar", CALENDAR_SYNC_HOUR)):
         return
     await run_calendar_sync("daily")
 
@@ -404,7 +416,6 @@ def exam_change_embed(exam: dict, old_date: str, old_content: str) -> discord.Em
 
 @tasks.loop(minutes=CHECK_INTERVAL)
 async def check_exams():
-    await bot.wait_until_ready()
     channel = find_channel(EXAMS_CHANNEL)
     if not channel:
         return
@@ -421,6 +432,13 @@ async def check_exams():
         save_json(SEEN_EXAMS_FILE, seen)
     except Exception as e:
         print(f"[check_exams] {e}")
+    rejitter(check_exams, CHECK_INTERVAL)
+
+
+@check_exams.before_loop
+async def before_exams():
+    await bot.wait_until_ready()
+    await stagger()
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +505,7 @@ async def build_reminder(now: datetime) -> tuple[discord.Embed | None, list, dic
 async def evening_reminder():
     now   = datetime.now(CET)
     today = today_str(now)
-    if now.hour < REMINDER_HOUR:
+    if (now.hour, now.minute) < logic.daily_time(today, "reminder", REMINDER_HOUR):
         return
     state = load_json(REMINDER_FILE, {})
     if state.get("last") == today:
@@ -523,7 +541,7 @@ def morning_due(now: datetime) -> bool:
     if not MORNING_ALERT:
         return False
     h, m = (int(x) for x in MORNING_ALERT.split(":"))
-    return (now.hour, now.minute) >= (h, m)
+    return (now.hour, now.minute) >= logic.daily_time(today_str(now), "morning", h, m)
 
 
 @tasks.loop(minutes=1)
@@ -560,28 +578,34 @@ async def before_morning():
 # Lucky number — a DM when it is yours (no questioning today)
 # ---------------------------------------------------------------------------
 
-@tasks.loop(minutes=10)
+@tasks.loop(minutes=1)
 async def lucky_check():
+    """At most 3 requests a day, at random times between 6:00 and 8:00 (fixed per
+    day); stops at the first answer. The 1-minute loop itself makes no request."""
     now   = datetime.now(CET)
     today = today_str(now)
-    if not LUCKY_NUMBER or not (6 <= now.hour < 16):
+    if not LUCKY_NUMBER or now.weekday() >= 5:
         return
     state = load_json(REMINDER_FILE, {})
-    if state.get("lucky") == today:
+    tries = state.get("lucky_tries") or {}
+    done  = tries.get("n", 0) if tries.get("date") == today else 0
+    slots = logic.lucky_slots(today)
+    if state.get("lucky") == today or done >= len(slots) or (now.hour, now.minute) < slots[done]:
         return
+    state["lucky_tries"] = {"date": today, "n": done + 1}
     try:
         n = await asyncio.to_thread(get_client().get_lucky_number)
-        if n is None:            # not drawn yet, weekend or holiday — try again later
-            return
-        if int(n) == LUCKY_NUMBER:
-            owner = await bot.fetch_user(OWNER_ID)
-            await owner.send(embed=discord.Embed(
-                title=f"🍀 Lucky number today: {n} — that's you",
-                description="You should not be questioned today.", color=0x3FB950).set_footer(text="Vred"))
-        state["lucky"] = today
-        save_json(REMINDER_FILE, state)
+        if n is not None:        # None = not drawn yet or a day off — the next slot retries
+            state["lucky"] = today
+            state["lucky_value"] = {"date": today, "n": int(n)}
+            if int(n) == LUCKY_NUMBER:
+                owner = await bot.fetch_user(OWNER_ID)
+                await owner.send(embed=discord.Embed(
+                    title=f"🍀 Lucky number today: {n} — that's you",
+                    description="You should not be questioned today.", color=0x3FB950).set_footer(text="Vred"))
     except Exception as e:
         print(f"[lucky_check] {e}")
+    save_json(REMINDER_FILE, state)
 
 
 @lucky_check.before_loop
@@ -598,7 +622,8 @@ def digest_due(now: datetime) -> bool:
         return False
     day, hm = WEEKLY_DIGEST.lower().split()
     h, m = (int(x) for x in hm.split(":"))
-    return WEEKDAYS[now.weekday()][:3].lower() == day[:3] and (now.hour, now.minute) >= (h, m)
+    return (WEEKDAYS[now.weekday()][:3].lower() == day[:3]
+            and (now.hour, now.minute) >= logic.daily_time(today_str(now), "digest", h, m))
 
 
 async def build_digest(now: datetime) -> discord.Embed:
@@ -757,11 +782,13 @@ async def check_grades():
         save_json(GRADE_EDGES_FILE, edges)
     except Exception as e:
         print(f"[check_grades] {e}")
+    rejitter(check_grades, CHECK_INTERVAL)
 
 
 @check_grades.before_loop
 async def before_grades():
     await bot.wait_until_ready()
+    await stagger()
 
 
 # ---------------------------------------------------------------------------
@@ -817,11 +844,13 @@ async def check_messages():
             check_messages.stop()
             return
         print(f"[check_messages] {e}")
+    rejitter(check_messages, MESSAGES_INTERVAL)
 
 
 @check_messages.before_loop
 async def before_messages():
     await bot.wait_until_ready()
+    await stagger()
 
 
 # ---------------------------------------------------------------------------
@@ -946,11 +975,13 @@ async def check_school():
                      ("notes", notes), ("summary", summary)):
         await _check_section(name, state, fn)
     save_json(SEEN_SCHOOL_FILE, state)
+    rejitter(check_school, CHECK_INTERVAL)
 
 
 @check_school.before_loop
 async def before_school():
     await bot.wait_until_ready()
+    await stagger()
 
 
 # ---------------------------------------------------------------------------
@@ -996,11 +1027,13 @@ async def archive_topics():
             print(f"[archive_topics] {added} topics added or updated, {len(st['lessons'])} in total")
     except Exception as e:
         print(f"[archive_topics] {e}")
+    rejitter(archive_topics, 6 * 60)
 
 
 @archive_topics.before_loop
 async def before_archive():
     await bot.wait_until_ready()
+    await stagger()
 
 
 # ---------------------------------------------------------------------------
@@ -1950,32 +1983,37 @@ def days_until_label(date_str: str, now: datetime) -> str:
 
 
 status_index = 0
+# The text rotates every 5 min, but the register is asked only about once an hour:
+# this loop used to make 3 requests every 5 minutes (~860 a day) just for the status.
+_status_data: dict = {"next": 0.0, "lessons": 0, "exam": None, "day": ""}
 
 
 @tasks.loop(minutes=5)
 async def rotate_status():
     global status_index
+    import time
     try:
-        now    = datetime.now(CET)
-        client = get_client()
-        slots  = ["Timetable | /help"]
-
-        lucky = await asyncio.to_thread(client.get_lucky_number)
-        if lucky:
-            slots.append(f"🍀 Lucky number: {lucky}")
-
-        lessons = await asyncio.to_thread(client.get_lessons, now, now)
-        today   = [l for l in lessons if lesson_date(l) == today_str(now)]
-        if today:
-            slots.append(f"📅 {len(today)} lessons today")
-
-        exams = await asyncio.to_thread(client.get_exams, now, now + timedelta(weeks=8))
-        exams = sorted(exams, key=lambda e: exam_date(e) or "9999")
-        if exams:
+        now = datetime.now(CET)
+        if time.monotonic() >= _status_data["next"] or _status_data["day"] != today_str(now):
+            client  = get_client()
+            lessons = await asyncio.to_thread(client.get_lessons, now, now)
+            exams   = await asyncio.to_thread(client.get_exams, now, now + timedelta(weeks=8))
+            exams   = sorted(exams, key=lambda e: exam_date(e) or "9999")
+            _status_data.update(next=time.monotonic() + logic.jittered(60) * 60, day=today_str(now),
+                                lessons=len([l for l in lessons if lesson_date(l) == today_str(now)]),
+                                exam=exams[0] if exams else None)
+        slots = ["Timetable | /help"]
+        lucky = load_json(REMINDER_FILE, {}).get("lucky_value") or {}
+        if lucky.get("date") == today_str(now):        # read by lucky_check in the morning
+            slots.append(f"🍀 Lucky number: {lucky['n']}")
+        if _status_data["lessons"]:
+            slots.append(f"📅 {_status_data['lessons']} lessons today")
+        e = _status_data["exam"]
+        if e:
             try:
-                slots.append(f"📝 {exam_subject(exams[0])} {days_until_label(exam_date(exams[0]), now)}")
+                slots.append(f"📝 {exam_subject(e)} {days_until_label(exam_date(e), now)}")
             except Exception:
-                slots.append(f"📝 {exam_subject(exams[0])}")
+                slots.append(f"📝 {exam_subject(e)}")
 
         status = slots[status_index % len(slots)]
         status_index += 1
